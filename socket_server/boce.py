@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import json
+import shutil
 import threading
 import asyncio
 import logging
@@ -9,7 +10,6 @@ import subprocess
 import atexit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
-from pyppeteer import launch
 
 logger = logging.getLogger(__name__)
 
@@ -69,49 +69,12 @@ class RequestChecker:
             "success_ratio": f"{success_ratio:.2f}%"
         }
 
-def ensure_command(cmd: str, install_cmd: str = None):
-    """
-    确保系统中存在指定命令，如果不存在且提供了安装命令，则尝试自动安装。
-
-    参数:
-        cmd (str): 要检测的系统命令名称，例如 "ifconfig"、"curl" 等。
-        install_cmd (str): 可选，当 cmd 不存在时要执行的安装命令（如 yum/apt 安装指令）。
-
-    返回:
-        True  - 命令存在，或已执行安装指令（不保证安装成功）
-        False - 命令不存在，且未提供安装命令
-    """
-
-    # 使用 shutil.which 判断命令是否存在于系统 PATH 中
-    if shutil.which(cmd):
-        print(f"✅ {cmd} 存在")
-        return True
-    else:
-        print(f"❌ {cmd} 不存在")
-
-        # 如果提供了安装命令，尝试自动安装
-        if install_cmd:
-            print(f"尝试安装：{install_cmd}")
-            # 使用 subprocess 运行安装命令，shell=True 允许执行 shell 语法
-            subprocess.run(install_cmd, shell=True)
-            if shutil.which(cmd):
-                print(f"✅ {cmd} 存在")
-                return True
-        # 返回 False 表示命令不存在（即使已尝试安装，也不确定是否成功）
-        return False
-
-# 全局变量 抓包工具命令_sniff_command
+# 全局变量 抓包工具命令_sniff_command（由 __init__.init_capture 同步）
 _sniff_command = None
 
-# 全局变量 CPU绑定记录（内存中，程序重启自动清空）
-_nic_cpu_binding = {}  # 网卡 -> CPU 映射，如 {"eth0": 1, "eth1": 2}
+_nic_cpu_binding = {}  # 网卡 -> CPU 映射
 _allocated_cpus = set()  # 已分配的CPU集合
 _cpu_binding_lock = threading.Lock()  # 线程锁
-if ensure_command("dumpcap"):
-    _sniff_command = ("dumpcap")
-elif ensure_command("tcpdump"):
-    _sniff_command = ("tcpdump")
-logger.info(f"使用抓包工具：{_sniff_command}")
 
 # 全局 event loop 和 browser
 _global_loop = None
@@ -164,12 +127,22 @@ def get_global_loop_and_browser(chromium_path):
 class BrowserManager:
     @staticmethod
     def is_browser_closed(browser):
-        # 兼容不同 pyppeteer 版本
         if hasattr(browser, "is_closed"):
             return browser.is_closed()
         elif hasattr(browser, "_connection"):
             return browser._connection is None
         return True
+
+    @staticmethod
+    async def close_browser():
+        global _browser
+        if _browser is not None:
+            try:
+                if not BrowserManager.is_browser_closed(_browser):
+                    await _browser.close()
+            except Exception as e:
+                logger.warning(f"关闭 browser 失败: {e}")
+            _browser = None
 
     @classmethod
     async def get_browser(cls, chromium_path=None):
@@ -351,12 +324,12 @@ def kill_all_chrome():
         os.system("taskkill /F /IM chromium.exe /T")
 
 class BoceChecker:
-    def __init__(self, url="http://www.123.com/",timeout=3, chromium_path="/opt/socket/chrome-linux/chrome"):
+    def __init__(self, url="http://www.123.com/", timeout=3, chromium_path="/opt/socket/chrome-linux/chrome"):
         self.url = url
         self.timeout = timeout
         self.chromium_path = chromium_path
         self.r_checker = RequestChecker(url=self.url, timeout=self.timeout)
-        self.p_checker = PyppeteerChecker(url=self.url, chromium_path=self.chromium_path, timeout=self.timeout)
+        self.p_checker = None  # 延迟初始化，避免 import 时 chromium 不存在导致崩溃
 
     def update(self):
         self.r_checker.url = self.url
@@ -365,13 +338,14 @@ class BoceChecker:
         self.r_checker.success = 0
         self.r_checker.fail = 0
         self.r_checker.time_consumed = 0
-        self.p_checker.url = self.url
-        self.p_checker.chromium_path = self.chromium_path
-        self.p_checker.timeout = self.timeout
-        self.p_checker.total = 0
-        self.p_checker.success = 0
-        self.p_checker.fail = 0
-        self.p_checker.time_consumed = 0
+        if self.p_checker:
+            self.p_checker.url = self.url
+            self.p_checker.chromium_path = self.chromium_path
+            self.p_checker.timeout = self.timeout
+            self.p_checker.total = 0
+            self.p_checker.success = 0
+            self.p_checker.fail = 0
+            self.p_checker.time_consumed = 0
     def boce(self, url, count=1, interval=0, thread_count=1, timeout=3, mode="封堵", chromium_path="/opt/socket/chrome-linux/chrome"):
         self.url = url
         self.thread_count = thread_count
@@ -389,6 +363,9 @@ class BoceChecker:
         print(f"开始pyppeteer {mode}拨测...")
         if not chromium_path:
             raise ValueError("必须指定 Chromium 可执行文件路径参数 chromium_path")
+        # 延迟初始化 p_checker
+        if self.p_checker is None:
+            self.p_checker = PyppeteerChecker(url=self.url, chromium_path=self.chromium_path, timeout=self.timeout)
         # 懒加载全局loop/browser
         loop, browser = get_global_loop_and_browser(chromium_path)
         future = asyncio.run_coroutine_threadsafe(self.p_checker.run_multiple(count, mode), loop)

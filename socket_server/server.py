@@ -30,16 +30,13 @@ class TrackedTCPHandler(socketserver.BaseRequestHandler):
         global _active_clients
         with _client_lock:
             _active_clients += 1
-        # 初始化协议处理器状态
-        self.filepath = "tmp"
-        self.content = b""
-        self.bin_recv_flag = False
-        self.length = 0
+        super().setup()
 
     def finish(self):
         global _active_clients, _last_disconnect_time
         with _client_lock:
-            _active_clients -= 1
+            if _active_clients > 0:
+                _active_clients -= 1
             if _active_clients == 0:
                 _last_disconnect_time = time.time()
 

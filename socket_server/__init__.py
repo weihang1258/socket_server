@@ -36,7 +36,7 @@ _sniff_command = None
 
 
 def init_capture():
-    """检测抓包工具并同步到 capture 模块"""
+    """检测抓包工具并同步到 capture/boce 模块"""
     global _sniff_command
     from .netutils import ensure_command
     if ensure_command("dumpcap"):
@@ -45,6 +45,8 @@ def init_capture():
         _sniff_command = "tcpdump"
     from . import capture
     capture._sniff_command = _sniff_command
+    from . import boce
+    boce._sniff_command = _sniff_command
 
 
 def setup_environment():
@@ -58,7 +60,7 @@ def setup_environment():
     cmd = "dirname `find /usr/local/ -type f -name java|head -n 1`"
     path_java = os.popen(cmd).read().strip()
     if path_java:
-        os.environ["PATH"] = path_java + ":" + os.environ["PATH"]
+        os.environ["PATH"] = path_java + ":" + os.environ.get("PATH", "")
         os.environ["JAVA_HOME"] = "/usr/local/jdk1.8.0_202"
 
     # 打包chromium驱动

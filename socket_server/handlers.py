@@ -4,7 +4,6 @@ import struct
 import shutil
 import logging
 from io import BytesIO
-from scapy.all import PcapWriter
 
 from .version import VERSION
 from .netutils import (
@@ -12,10 +11,7 @@ from .netutils import (
     wait_until, wait_not_until, ensure_command,
     compress_gzip, decompress_gzip, unzip, python_cmd
 )
-from .capture import (
-    tcpdump_start, tcpdump_stop, Tcpdump_scapy,
-    _sniff_command as capture_sniff_command
-)
+from .capture import tcpdump_start, tcpdump_stop, Tcpdump_scapy
 from .boce import BoceChecker
 from .socket_listen import SocketServerListen
 from .pcap_flow import extract_pcap_flow_five_tuples
@@ -23,10 +19,10 @@ from .replayer import PcapReplayer
 
 logger = logging.getLogger(__name__)
 
-# 模块级全局状态
+# 模块级全局状态（延迟初始化）
 tcpdump_scapy = None
 ss = None
-boce = BoceChecker()
+boce = None  # 延迟初始化，避免 import 时依赖 chromium
 cache_sendpkts = None
 
 
@@ -156,12 +152,17 @@ def do(datatype, data: bytes, **kwargs):
     # 停止抓包
     elif datatype == 122:
         logger.info("停止抓包，类型：%s" % datatype)
+        if tcpdump_scapy is None:
+            return json.dumps({"error": "未在抓包"}).encode("utf-8")
         tcpdump_scapy.stop()
         return b"ok"
 
     # 下载pcap包
     elif datatype == 123:
         logger.info("下载pcap包，类型：%s" % datatype)
+        if tcpdump_scapy is None:
+            return json.dumps({"error": "未在抓包"}).encode("utf-8")
+        from scapy.all import PcapWriter
         with BytesIO() as fl:
             PcapWriter(fl).write(tcpdump_scapy.pkts)
             fl.seek(0)
@@ -218,7 +219,10 @@ def do(datatype, data: bytes, **kwargs):
                     return res
                 logger.info("chromium 依赖库安装成功，继续执行拨测")
 
-        response = boce.boce(**data)
+        response = boce.boce(**data) if boce else None
+        if response is None:
+            boce = BoceChecker()
+            response = boce.boce(**data)
         logger.info(response)
         res = json.dumps(response).encode("utf-8")
         res = struct.pack("i", len(res)) + res
@@ -293,6 +297,8 @@ def do(datatype, data: bytes, **kwargs):
     # socket监听-传输数据
     elif datatype == 174:
         logger.info("socket监听-传输数据流，类型：%s" % datatype)
+        if ss is None:
+            return json.dumps({"error": "未启动监听"}).encode("utf-8")
         content = compress_gzip(ss.data)
         msg = struct.pack("<Q", len(content)) + content
         return msg

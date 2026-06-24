@@ -17,10 +17,19 @@ GITHUB_API = f"https://api.github.com/repos/{REPO}/releases"
 INSTALL_DIR = "/opt/socket"
 
 
+def _github_headers():
+    """构建 GitHub API 请求头，如果环境变量有 GITHUB_TOKEN 则带上认证"""
+    headers = {"Accept": "application/vnd.github+json"}
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
 def get_releases():
     """获取 GitHub 所有 Release 列表"""
     try:
-        resp = requests.get(GITHUB_API, timeout=10)
+        resp = requests.get(GITHUB_API, timeout=10, headers=_github_headers())
         resp.raise_for_status()
         releases = resp.json()
         result = []
@@ -43,7 +52,7 @@ def get_latest():
     """获取最新 Release"""
     try:
         url = f"{GITHUB_API}/latest"
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=10, headers=_github_headers())
         resp.raise_for_status()
         r = resp.json()
         tag = r.get("tag_name", "").lstrip("v")
@@ -80,7 +89,7 @@ def _find_sha256_asset(assets):
 def _download_file(url, dest_path):
     """下载文件到指定路径，支持大文件流式写入"""
     logger.info(f"下载: {url} -> {dest_path}")
-    resp = requests.get(url, stream=True, timeout=300)
+    resp = requests.get(url, stream=True, timeout=300, headers=_github_headers())
     resp.raise_for_status()
     with open(dest_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
@@ -90,7 +99,7 @@ def _download_file(url, dest_path):
 def _verify_sha256(filepath, sha256_url):
     """校验文件 sha256"""
     try:
-        resp = requests.get(sha256_url, timeout=10)
+        resp = requests.get(sha256_url, timeout=10, headers=_github_headers())
         resp.raise_for_status()
         expected = resp.text.strip().split()[0]  # 格式: "hash  filename"
         h = hashlib.sha256()
@@ -149,7 +158,7 @@ def download_version(version, assets):
     final_binary = os.path.join(version_dir, "socket_server")
     os.chmod(staging_binary, 0o755)
     os.replace(staging_binary, final_binary)
-    os.rmdir(staging_dir)  # 删除空的 .staging 目录
+    shutil.rmtree(staging_dir, ignore_errors=True)
     logger.info(f"版本 {version} 下载完成: {final_binary}")
     return True
 
@@ -291,7 +300,7 @@ def show_current():
     # 尝试获取当前版本的 notes
     try:
         url = f"{GITHUB_API}/tags/v{VERSION}"
-        resp = requests.get(url, timeout=5)
+        resp = requests.get(url, timeout=5, headers=_github_headers())
         if resp.status_code == 200:
             notes = resp.json().get("body", "")
             if notes:

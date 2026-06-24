@@ -3,7 +3,6 @@ import time
 import struct
 import logging
 import threading
-from scapy.all import sniff, wrpcap
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +29,7 @@ def tcpdump_stop(path="/home/tmp/tmp.pcap"):
     if response["code"]:
         return False
     if isfile(path):
-        if wait_not_until(os.path.getsize, expect_value="0", step=1, timeout=20, filename=path) and wait_until(
+        if wait_not_until(os.path.getsize, expect_value=0, step=1, timeout=20, filename=path) and wait_until(
                 os.access, expect_value=True, step=1, timeout=20, path=path, mode=os.W_OK):
             return True
         else:
@@ -105,6 +104,7 @@ class Tcpdump_scapy:
             self.iface = routeinfo()["0.0.0.0"]["Iface"]
 
     def _sniff(self):
+        from scapy.all import sniff, wrpcap
         self.e = False
         # self.pkts = sniff(iface=self.iface, count=0, prn=lambda x: x.sprintf('{IP:%IP.src%->%IP.dst%}'),filter=self.filter, stop_filter=lambda x: self.e, timeout=self.timeout) # 进行抓包操作
         self.pkts = sniff(iface=self.iface, count=0, prn=lambda x: x.sprintf('{IP:%IP.src%->%IP.dst%}'),
