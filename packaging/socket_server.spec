@@ -1,19 +1,23 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
+import sys
 from pathlib import Path
 
 block_cipher = None
 
+# spec 文件在 packaging/ 子目录，项目根目录是其父目录
+ROOTDIR = os.path.abspath(os.path.join(SPECPATH, '..'))
+
 # 从 version.py 读取版本号
-version_file = os.path.join(os.path.dirname(SPECPATH), '..', 'socket_server', 'version.py')
+version_file = os.path.join(ROOTDIR, 'socket_server', 'version.py')
 version_vars = {}
 with open(version_file) as f:
     exec(f.read(), version_vars)
 VERSION = version_vars.get('VERSION', '0.0.0')
 
 a = Analysis(
-    ['socket_server/__main__.py'],
-    pathex=[],
+    [os.path.join(ROOTDIR, 'packaging', 'entry.py')],
+    pathex=[ROOTDIR],
     binaries=[],
     datas=[],
     hiddenimports=[
@@ -68,7 +72,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=True,
