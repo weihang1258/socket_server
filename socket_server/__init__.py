@@ -4,7 +4,6 @@ import logging
 from pathlib import Path
 
 from .version import VERSION, REPO
-from .netutils import ensure_command
 
 # 全局 logger 配置
 logger = logging.getLogger("socket_server")
@@ -16,29 +15,34 @@ _ch = None
 def setup_logging(log_file="/var/log/socket_server.log"):
     """初始化日志 handler（仅在 serve 时调用）"""
     global _fh, _ch
-    if _fh is not None:
+    if _ch is not None:
         return  # 已初始化
-    _fh = logging.FileHandler(log_file, encoding='utf-8')
-    _fh.setLevel(logging.INFO)
     _ch = logging.StreamHandler()
     _ch.setLevel(logging.INFO)
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    _fh.setFormatter(formatter)
     _ch.setFormatter(formatter)
-    logger.addHandler(_fh)
     logger.addHandler(_ch)
+    # 文件 handler：目录不存在时跳过（CLI 子命令在非 Linux 环境下可能无 /var/log）
+    log_dir = os.path.dirname(log_file)
+    if os.path.isdir(log_dir):
+        _fh = logging.FileHandler(log_file, encoding='utf-8')
+        _fh.setLevel(logging.INFO)
+        _fh.setFormatter(formatter)
+        logger.addHandler(_fh)
 
 
-# 抓包工具初始化
+# 抓包工具初始化（延迟到 setup_environment）
 _sniff_command = None
-if ensure_command("dumpcap"):
-    _sniff_command = "dumpcap"
-elif ensure_command("tcpdump"):
-    _sniff_command = "tcpdump"
 
 
 def init_capture():
-    """将 _sniff_command 同步到 capture 模块"""
+    """检测抓包工具并同步到 capture 模块"""
+    global _sniff_command
+    from .netutils import ensure_command
+    if ensure_command("dumpcap"):
+        _sniff_command = "dumpcap"
+    elif ensure_command("tcpdump"):
+        _sniff_command = "tcpdump"
     from . import capture
     capture._sniff_command = _sniff_command
 
@@ -47,8 +51,8 @@ def setup_environment():
     """serve 启动时的环境初始化（防火墙、java、chromium 等）"""
     setup_logging()
     logger.info(f"version:{VERSION}")
-    logger.info(f"使用抓包工具：{_sniff_command}")
     init_capture()
+    logger.info(f"使用抓包工具：{_sniff_command}")
 
     # java 路径
     cmd = "dirname `find /usr/local/ -type f -name java|head -n 1`"

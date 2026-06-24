@@ -119,15 +119,15 @@ def cur_time(mode=2):
 
 def ensure_command(cmd: str, install_cmd: str = None):
     if shutil.which(cmd):
-        print(f"✅ {cmd} 存在")
+        print(f"[OK] {cmd} exists")
         return True
     else:
-        print(f"❌ {cmd} 不存在")
+        print(f"[NO] {cmd} not found")
         if install_cmd:
-            print(f"尝试安装：{install_cmd}")
+            print(f"Installing: {install_cmd}")
             subprocess.run(install_cmd, shell=True)
             if shutil.which(cmd):
-                print(f"✅ {cmd} 存在")
+                print(f"[OK] {cmd} exists")
                 return True
         return False
 
