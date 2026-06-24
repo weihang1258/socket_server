@@ -4,4 +4,6 @@ venv/
 build/
 dist/
 *.spec
+!packaging/*.spec
 .vscode/
+*.egg-info/

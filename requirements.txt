@@ -4,3 +4,4 @@ psutil
 wheel
 pyinstaller
 pyppeteer
+packaging

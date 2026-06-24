@@ -17,18 +17,25 @@ http_proxy=http://10.12.186.204:7897 https_proxy=http://10.12.186.204:7897 yum i
 # 打包
 python3 -m venv venv
 
-
 source venv/bin/activate
 
 pip3 install -i https://pypi.tuna.tsinghua.edu.cn/simple --proxy http://10.12.186.204:7897 --upgrade pip
 pip3 install -i https://pypi.tuna.tsinghua.edu.cn/simple --proxy http://10.12.186.204:7897 -r requirements.txt
 
+# 打包（新方式：使用 spec 文件，产物为单文件 socket_server）
+pyinstaller packaging/socket_server.spec
 
+# 部署到靶机
+# 1. scp dist/socket_server 到 /opt/socket/versions/<版本号>/socket_server
+# 2. 创建符号链接: ln -sf /opt/socket/versions/<版本号> /opt/socket/versions/current
+# 3. ./socket_server enable  （安装 systemd unit + 开机自启）
+# 4. ./socket_server start    （启动服务）
 
-pyinstaller socket_server_1.2.py --onefile
-pyinstaller socket_server_monitor.py --onefile
-pyinstaller env_init.py --onefile
-
-
+# GitHub Release 发布流程
+# 1. 更新 socket_server/version.py 的 VERSION
+# 2. 打包: pyinstaller packaging/socket_server.spec
+# 3. 生成 sha256: sha256sum dist/socket_server > dist/socket_server.sha256
+# 4. 推送代码到 GitHub
+# 5. 创建 Release: gh release create v<版本号> dist/socket_server dist/socket_server.sha256
 
 deactivate
