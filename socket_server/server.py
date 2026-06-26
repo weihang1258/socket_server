@@ -20,11 +20,8 @@ def get_idle_state():
         return _active_clients, time.time() - _last_disconnect_time
 
 
-class TrackedTCPHandler(socketserver.BaseRequestHandler):
-    """带客户端连接计数的 TCP Handler 基类。
-
-    子类需实现 on_data(datatype, data, **kwargs) -> bytes|None
-    """
+class TrackedTCPHandler:
+    """Mixin: 客户端连接计数。不继承 BaseRequestHandler，以确保 MRO 正确。"""
 
     def setup(self):
         global _active_clients
@@ -39,6 +36,7 @@ class TrackedTCPHandler(socketserver.BaseRequestHandler):
                 _active_clients -= 1
             if _active_clients == 0:
                 _last_disconnect_time = time.time()
+        super().finish()
 
 
 def start_tcp_server(port, handler_class):
