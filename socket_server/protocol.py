@@ -2,13 +2,14 @@ import struct
 import json
 import time
 import logging
+import socketserver
 
 from .netutils import decompress_gzip, compress_gzip
 
 logger = logging.getLogger(__name__)
 
 
-class MyTCPHandler:
+class MyTCPHandler(socketserver.BaseRequestHandler):
     """TCP 协议处理器：收包/分包/文件传输协议。
 
     子类需实现：
