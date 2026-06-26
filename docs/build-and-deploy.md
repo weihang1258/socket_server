@@ -24,6 +24,12 @@ cd socket_server
 sudo http_proxy=http://10.12.186.204:7897 https_proxy=http://10.12.186.204:7897 git clone https://github.com/weihang1258/socket_server.git
 ```
 
+更新代码：
+```bash
+cd /opt/socket_server
+git pull
+```
+
 ## 3. 创建打包虚拟环境
 
 ```bash
@@ -76,6 +82,9 @@ packaging
 # 确保虚拟环境已激活
 source venv/bin/activate
 
+# 查看当前版本号
+python3 -c "from socket_server.version import VERSION; print(VERSION)"
+
 # 执行打包（使用 spec 文件）
 pyinstaller packaging/socket_server.spec --clean
 ```
@@ -94,15 +103,18 @@ ls -lh dist/socket_server
 ### 6.1 首次部署
 
 ```bash
+# 读取当前版本号
+VER=$(python3 -c "from socket_server.version import VERSION; print(VERSION)")
+
 # 创建目录结构
-sudo mkdir -p /opt/socket/versions/1.3.0
+sudo mkdir -p /opt/socket/versions/$VER
 
 # 复制二进制到版本目录
-sudo cp dist/socket_server /opt/socket/versions/1.3.0/socket_server
-sudo chmod +x /opt/socket/versions/1.3.0/socket_server
+sudo cp dist/socket_server /opt/socket/versions/$VER/socket_server
+sudo chmod +x /opt/socket/versions/$VER/socket_server
 
 # 创建 current 符号链接
-sudo ln -sf /opt/socket/versions/1.3.0 /opt/socket/versions/current
+sudo ln -sf /opt/socket/versions/$VER /opt/socket/versions/current
 
 # 安装 systemd 服务 + 开机自启
 sudo /opt/socket/versions/current/socket_server enable
@@ -116,7 +128,6 @@ sudo /opt/socket/versions/current/socket_server start
 ```bash
 # 查看当前版本
 /opt/socket/versions/current/socket_server current
-# 输出：当前版本: v1.3.0
 
 # 查看服务状态
 systemctl status socket_server
@@ -152,7 +163,7 @@ tail -f /var/log/socket_server.log
 sudo /opt/socket/versions/current/socket_server upgrade
 
 # 或切换到指定版本
-sudo /opt/socket/versions/current/socket_server switch 1.4.0
+sudo /opt/socket/versions/current/socket_server switch <版本号>
 ```
 
 ### 7.2 自动升级
@@ -180,11 +191,11 @@ autoupgrade=on
 
 ```bash
 # 1. 更新版本号
-#    编辑 socket_server/version.py，修改 VERSION = "1.4.0"
+#    编辑 socket_server/version.py，修改 VERSION = "新版本号"
 
 # 2. 提交并推送
 git add socket_server/version.py
-git commit -m "release: v1.4.0"
+git commit -m "release: v新版本号"
 git push
 
 # 3. 在 Linux 打包机上拉取最新代码并打包
@@ -193,12 +204,15 @@ git pull
 source venv/bin/activate
 pyinstaller packaging/socket_server.spec --clean
 
-# 4. 生成 sha256 校验
+# 4. 读取版本号
+VER=$(python3 -c "from socket_server.version import VERSION; print(VERSION)")
+
+# 5. 生成 sha256 校验
 sha256sum dist/socket_server > dist/socket_server.sha256
 
-# 5. 创建 GitHub Release（需要 gh CLI 或在网页操作）
-gh release create v1.4.0 dist/socket_server dist/socket_server.sha256 \
-    --title "v1.4.0" \
+# 6. 创建 GitHub Release（需要 gh CLI 或在网页操作）
+gh release create v$VER dist/socket_server dist/socket_server.sha256 \
+    --title "v$VER" \
     --notes "版本更新说明"
 ```
 
@@ -231,11 +245,9 @@ sudo apt-get install -y libx11-6 libxcomposite1 libxcursor1 libxdamage1 \
 /opt/socket/
 ├── config                              # 配置文件（autoupgrade=on）
 └── versions/
-    ├── current -> /opt/socket/versions/1.3.0   # 当前版本符号链接
-    ├── 1.3.0/
-    │   └── socket_server              # 可执行文件
-    └── 1.4.0/
-        └── socket_server              # 升级后的新版本
+    ├── current -> /opt/socket/versions/<当前版本>   # 符号链接，指向当前使用的版本
+    └── <版本号>/
+        └── socket_server              # 可执行文件
 ```
 
 ```
