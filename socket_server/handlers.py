@@ -236,6 +236,21 @@ def do(datatype, data: bytes, **kwargs):
         res = json.dumps(response).encode("utf-8")
         return res
 
+    # 查询服务端版本详情
+    elif datatype == 19:
+        logger.info("查询服务端版本详情，类型：%s" % datatype)
+        from .upgrader import get_latest
+        info = {"version": VERSION, "repo": REPO}
+        try:
+            latest = get_latest()
+            if latest:
+                info["latest_version"] = latest["version"]
+                info["has_upgrade"] = latest["version"] != VERSION
+        except Exception:
+            pass
+        res = json.dumps(info).encode("utf-8")
+        return res
+
     # 解压zip文件
     elif datatype == 15:
         data = json.loads(s=data)
