@@ -43,16 +43,7 @@ class TrackedTCPHandler(socketserver.BaseRequestHandler):
 
 def start_tcp_server(port, handler_class):
     """启动 IPv4 + IPv6 双栈 TCP 服务器，阻塞运行。"""
-    from .protocol import MyTCPHandler
-
-    # 组合：TrackedTCPHandler + MyTCPHandler 的协议逻辑
-    # 使用多重继承让 handler 同时具备连接计数和协议处理能力
-    class CombinedHandler(TrackedTCPHandler, MyTCPHandler):
-        pass
-
-    # 如果 handler_class 不是 CombinedHandler，用传入的
-    # 实际上我们直接用 CombinedHandler
-    handler = CombinedHandler
+    handler = handler_class
 
     server4 = socketserver.ThreadingTCPServer(('0.0.0.0', port), handler)
     server6 = None
