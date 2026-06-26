@@ -12,8 +12,8 @@ VER=$(cat /tmp/_sv)
 curl -sLO https://github.com/weihang1258/socket_server/releases/download/v$VER/socket_server
 curl -sLO https://github.com/weihang1258/socket_server/releases/download/v$VER/socket_server.sha256
 
-# 校验
-sha256sum -c socket_server.sha256
+# 校验（sha256文件中路径为dist/socket_server，需替换为当前文件名）
+sed 's|dist/socket_server|socket_server|' socket_server.sha256 | sha256sum -c
 
 # 安装
 sudo mkdir -p /opt/socket/versions/$VER
