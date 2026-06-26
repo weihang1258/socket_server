@@ -4,16 +4,22 @@
 
 ## 安装
 
-从 [Releases](https://github.com/weihang1258/socket_server/releases) 下载最新版 `socket_server` 文件，然后执行：
-
 ```bash
-# 放到版本目录
-sudo mkdir -p /opt/socket/versions/1.3.0
-sudo cp socket_server /opt/socket/versions/1.3.0/socket_server
-sudo chmod +x /opt/socket/versions/1.3.0/socket_server
+# 下载最新版
+curl -sL https://api.github.com/repos/weihang1258/socket_server/releases/latest \
+  | grep '"tag_name"' | sed 's/.*"v\(.*\)".*/\1/' > /tmp/_sv
+VER=$(cat /tmp/_sv)
+curl -sLO https://github.com/weihang1258/socket_server/releases/download/v$VER/socket_server
+curl -sLO https://github.com/weihang1258/socket_server/releases/download/v$VER/socket_server.sha256
 
-# 设置当前版本
-sudo ln -sf /opt/socket/versions/1.3.0 /opt/socket/versions/current
+# 校验
+sha256sum -c socket_server.sha256
+
+# 安装
+sudo mkdir -p /opt/socket/versions/$VER
+sudo cp socket_server /opt/socket/versions/$VER/socket_server
+sudo chmod +x /opt/socket/versions/$VER/socket_server
+sudo ln -sf /opt/socket/versions/$VER /opt/socket/versions/current
 
 # 注册服务并启动
 sudo /opt/socket/versions/current/socket_server enable
@@ -33,14 +39,9 @@ sudo /opt/socket/versions/current/socket_server stop     # 停止
 ## 升级
 
 ```bash
-# 升级到最新版
-sudo /opt/socket/versions/current/socket_server upgrade
-
-# 切换到指定版本
-sudo /opt/socket/versions/current/socket_server switch 1.4.0
-
-# 查看可用版本
-/opt/socket/versions/current/socket_server list
+sudo /opt/socket/versions/current/socket_server upgrade          # 升级到最新版
+sudo /opt/socket/versions/current/socket_server switch 1.4.0    # 切换到指定版本
+/opt/socket/versions/current/socket_server list                  # 查看可用版本
 ```
 
 自动升级默认开启，每小时检查 GitHub，无客户端连接超过30分钟时自动切换并重启。
