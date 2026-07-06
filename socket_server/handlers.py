@@ -154,8 +154,10 @@ def do(datatype, data: bytes, **kwargs):
         logger.info("停止抓包，类型：%s" % datatype)
         if tcpdump_scapy is None:
             return json.dumps({"error": "未在抓包"}).encode("utf-8")
-        tcpdump_scapy.stop()
-        return b"ok"
+        ok = tcpdump_scapy.stop()
+        if ok:
+            return b"ok"
+        return json.dumps({"error": "停止抓包进程失败"}).encode("utf-8")
 
     # 下载pcap包
     elif datatype == 123:
@@ -177,8 +179,8 @@ def do(datatype, data: bytes, **kwargs):
         chromium_path = data.get("chromium_path", "/opt/socket/chrome-linux/chrome")
 
         test_result = exec_cmd_subprocess(
-            args=f"{chromium_path} --headless --no-sandbox --disable-gpu --dump-dom about:blank",
-            use_run=True
+            args=[chromium_path, "--headless", "--no-sandbox", "--disable-gpu", "--dump-dom", "about:blank"],
+            shell=False, use_run=True
         )
         if test_result['code'] != 0 and 'cannot open shared object file' in (test_result['stderr'] or ''):
             logger.info(f"chromium 缺少依赖库，尝试自动安装...\nstderr: {test_result['stderr']}")
@@ -209,8 +211,8 @@ def do(datatype, data: bytes, **kwargs):
                     f"安装结果 code={install_result['code']}\nstdout={install_result['stdout']}\nstderr={install_result['stderr']}")
 
                 recheck = exec_cmd_subprocess(
-                    args=f"{chromium_path} --headless --no-sandbox --disable-gpu --dump-dom about:blank",
-                    use_run=True
+                    args=[chromium_path, "--headless", "--no-sandbox", "--disable-gpu", "--dump-dom", "about:blank"],
+                    shell=False, use_run=True
                 )
                 if recheck['code'] != 0:
                     logger.error(f"安装后仍然失败: {recheck['stderr']}")

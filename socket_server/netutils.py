@@ -9,8 +9,49 @@ from collections import defaultdict
 logger = logging.getLogger(__name__)
 
 
+def _strip_sudo_if_root(args):
+    """以 root 运行时剥离简单的 'sudo ' 前缀。
+
+    服务端通过 systemd 以 root 运行，提权是多余的；且目标机 sudo 可能因
+    libldap/OpenSSL ABI 不匹配而损坏，导致所有 sudo 命令失败。剥离后命令
+    直接以 root 执行，行为等价且不受 sudo 损坏影响。
+
+    仅剥离裸 'sudo <cmd>'；带 sudo 自身选项（如 'sudo -E'、'sudo -u'）的
+    命令保留原样，避免改变语义。非 root 运行时不剥离。
+    """
+    if not hasattr(os, "geteuid") or os.geteuid() != 0 or not isinstance(args, str):
+        return args
+    s = args.strip()
+    if not (s.startswith("sudo ") or s.startswith("sudo\t")):
+        return args
+    after = s[5:].lstrip()
+    if not after or after.startswith("-"):
+        return args  # 带 sudo 选项或空命令，不剥离
+    logger.info(f"以 root 运行，剥离 sudo 前缀: {args!r} -> {after!r}")
+    return after
+
+
+def _clean_subprocess_env(env):
+    """清除 PyInstaller 打包注入的环境变量，避免污染子进程。
+
+    socket_server 是 PyInstaller 打包的二进制，运行时会把临时解包目录(_MEIxxxx)
+    注入 LD_LIBRARY_PATH。若子进程继承该变量，会优先从临时目录加载错误版本的
+    动态库（如 libcrypto/libssl），导致外部程序启动崩溃——实例：DPI 的 xsa 因
+    加载到打包的 libcrypto.so.1.1 而启动即崩，被 dpi_monitor 反复重启。
+    同时清除 _PYI_* 内部变量。保留 PATH/JAVA_HOME/LANG 等子进程可能需要的变量。
+    """
+    env = dict(os.environ if env is None else env)
+    for k in list(env.keys()):
+        if k == "LD_LIBRARY_PATH" or k.startswith("_PYI_"):
+            del env[k]
+    return env
+
+
 def exec_cmd_subprocess(args, cwd=None, env=None, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", wait=True, use_run=False):
     try:
+        if shell and isinstance(args, str):
+            args = _strip_sudo_if_root(args)
+        env = _clean_subprocess_env(env)
         if use_run:
             result = subprocess.run(args=args, cwd=cwd, env=env, shell=shell, stdout=stdout, stderr=stderr, encoding=encoding)
             return {"code": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
@@ -58,11 +99,28 @@ def mkdir(dir):
 def mtu(eth, value=2000):
     if not ensure_command("ifconfig"):
         raise RuntimeError("请检查系统是否存在命令：ifconfig")
-    cmd = "ifconfig %s|grep mtu|awk '{print $4}'" % eth
-    mtu_val = int(exec_cmd_subprocess(args=cmd)["stdout"])
+    # 用 list args + shell=False 执行，避免 eth 被客户端注入 shell 元字符；
+    # 在 Python 里解析 mtu 值，替代原 ifconfig|grep|awk 管道。
+    res = exec_cmd_subprocess(args=["ifconfig", eth], shell=False)
+    if res["code"] != 0:
+        raise RuntimeError(f"执行 ifconfig {eth} 失败: {res.get('stderr', '')}")
+    mtu_val = None
+    for line in res["stdout"].splitlines():
+        lower = line.lower()
+        if "mtu" in lower:
+            # 兼容两种格式：新式 "eth0: flags=...  mtu 1500" / 老式 "...  MTU:1500  ..."
+            parts = line.replace("MTU:", " mtu ").split()
+            for i, p in enumerate(parts):
+                if p.lower() == "mtu" and i + 1 < len(parts):
+                    mtu_val = parts[i + 1]
+                    break
+            if mtu_val is not None:
+                break
+    if mtu_val is None:
+        raise RuntimeError(f"无法从 ifconfig {eth} 输出中解析 mtu")
     if int(mtu_val) != value:
-        cmd = f"sudo ifconfig {eth} mtu {value}"
-        exec_cmd_subprocess(cmd)
+        # socket_server 以 root 运行，ifconfig 无需 sudo
+        exec_cmd_subprocess(args=["ifconfig", eth, "mtu", str(value)], shell=False)
         time.sleep(5)
 
 
@@ -74,6 +132,7 @@ def wait_until(func, expect_value, step=2, timeout=60, *args, **kwargs):
             act_value = func(*args, **kwargs)
         except Exception as e:
             logger.error(e)
+            time.sleep(step)  # 异常后也要等待，避免 CPU 空转
             continue
         if act_value == expect_value:
             flag = True
@@ -92,6 +151,7 @@ def wait_not_until(func, expect_value, step=2, timeout=60, *args, **kwargs):
             act_value = func(*args, **kwargs)
         except Exception as e:
             logger.error(e)
+            time.sleep(step)  # 异常后也要等待，避免 CPU 空转
             continue
         if act_value != expect_value:
             flag = True
@@ -158,17 +218,22 @@ def decompress_gzip(compressed_data):
 
 
 def unzip(file, outdir=None, passwd=None, overwrite=True):
-    check = exec_cmd_subprocess("unzip -v")
+    check = exec_cmd_subprocess(args=["unzip", "-v"], shell=False)
     if check["code"] != 0:
         logger.error(check["stderr"])
         return
     dir = os.path.dirname(file)
     filename = os.path.basename(file)
-    str_overwrite = "-o" if overwrite else ""
-    str_passwd = f"-P {passwd}" if passwd else ""
-    str_outdir = f"-d {outdir}" if outdir else ""
-    cmd = f"unzip {str_overwrite} {str_passwd} {filename} {str_outdir}"
-    exec_cmd_subprocess(cmd, cwd=dir)
+    # 用 list args + shell=False，避免 filename/passwd/outdir 被客户端注入 shell 元字符
+    cmd = ["unzip"]
+    if overwrite:
+        cmd.append("-o")
+    if passwd:
+        cmd += ["-P", passwd]
+    cmd.append(filename)
+    if outdir:
+        cmd += ["-d", outdir]
+    exec_cmd_subprocess(args=cmd, shell=False, cwd=dir or None)
 
 
 def python_cmd(*args):

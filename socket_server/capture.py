@@ -1,6 +1,8 @@
 import os
 import time
 import struct
+import signal
+import shlex
 import logging
 import threading
 
@@ -17,41 +19,129 @@ _cpu_binding_lock = threading.Lock()
 
 from .netutils import routeinfo, isfile, wait_not_until, wait_until, exec_cmd_subprocess
 def tcpdump_stop(path="/home/tmp/tmp.pcap"):
+    """停止抓包进程并确保 pcap 文件 flush 完成。
+
+    安全策略：PID 文件精确 kill → SIGINT/SIGTERM/SIGKILL 升级 → 轮询文件大小稳定。
+    不用 pkill -f 正则，避免 path 注入和 SIGKILL 误杀其他用户进程。
+    """
     global _sniff_command
-    # cmd = "kill -SIGINT `ps -ef|grep tcpdump|grep '%s'|grep -v grep|awk '{print $2}'`" % path
     if _sniff_command == "tcpdump":
-        cmd = "pkill -SIGINT -f 'tcpdump.*%s'" % path
+        prog = "tcpdump"
     elif _sniff_command == "dumpcap":
-        cmd = "pkill -SIGINT -f 'dumpcap.*%s'" % path
+        prog = "dumpcap"
     else:
         raise RuntimeError("请检查系统是否存在命令：dumpcap 或者 tcpdump")
-    response = exec_cmd_subprocess(args=cmd)
-    if response["code"]:
+
+    # 幂等：进程已不在运行则直接成功
+    running, _ = tcpdump_isrun(path=path)
+    if not running:
+        return True
+
+    # 精确 kill PID，不依赖 pkill -f 正则（path 来自客户端不可信）。
+    # 每轮重新查询 PID，避免用过期 PID 误杀被回收的无关进程。
+    last_sig = None
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+        last_sig = sig
+        running, pids = tcpdump_isrun(path=path)
+        if not running:
+            break
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass  # 进程已退出
+        if wait_not_until(lambda: tcpdump_isrun(path=path)[0], expect_value=True,
+                          step=0.5, timeout=5):
+            break
+
+    running, _ = tcpdump_isrun(path=path)
+    if running:
+        logger.error("停止抓包进程失败：信号升级后进程仍存活")
         return False
+    # SIGKILL 后给内核 0.5s 刷新 tcpdump/dumpcap 的 pcap 缓冲区，
+    # 确保未落盘的数据写入文件，再进入轮询。
+    if last_sig == signal.SIGKILL:
+        time.sleep(0.5)
+
+    # 等待 pcap 文件写完：轮询文件大小稳定（连续两次相同即 flush 完成），
+    # 最长等待 20 秒。比 os.path.getsize/os.access 的"非0即成功"可靠。
     if isfile(path):
-        if wait_not_until(os.path.getsize, expect_value=0, step=1, timeout=20, filename=path) and wait_until(
-                os.access, expect_value=True, step=1, timeout=20, path=path, mode=os.W_OK):
+        if _wait_file_stable(path, timeout=20):
             return True
         else:
             return False
     else:
         return True
 
+
+def _wait_file_stable(filepath, timeout=20):
+    """轮询文件大小直到连续两次相同（缓冲区已 flush），超时返回 False。"""
+    deadline = time.time() + timeout
+    prev_size = -1
+    while time.time() < deadline:
+        try:
+            cur_size = os.path.getsize(filepath)
+        except OSError:
+            time.sleep(0.5)
+            continue
+        if cur_size == prev_size and cur_size > 0:
+            return True
+        prev_size = cur_size
+        time.sleep(0.5)
+    return False
+
+
+def _pid_matches(pid, prog, path):
+    """校验 pid 进程名 == prog 且 cmdline 含 path（字面子串，非正则）。
+    读取失败（进程已退出/权限不足）返回 False，避免 PID 回收后误杀。"""
+    try:
+        with open(f"/proc/{pid}/comm", "r") as f:
+            comm = f.read().strip()
+    except OSError:
+        return False
+    # comm 最多 15 字符，prog 可能被截断，用前缀兜底
+    if comm != prog and not prog.startswith(comm):
+        return False
+    if path:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", "replace")
+        except OSError:
+            return False
+        # path 作为字面子串匹配，不进 shell/正则，无注入
+        if path not in cmdline:
+            return False
+    return True
+
+
 def tcpdump_isrun(path="/home/tmp/tmp.pcap"):
+    """返回 (running: bool, pids: list)。
+
+    pgrep -x 精确匹配进程名（prog 为内部常量，非客户端输入），再用
+    /proc/{pid}/cmdline 二次校验 path（字面子串）。既避免 pkill -f 把 path
+    当扩展正则（注入），也避免误杀同名但不属于本次抓包的 tcpdump/dumpcap 进程。
+    """
     global _sniff_command
     if _sniff_command == "tcpdump":
-        cmd = "ps -ef|grep tcpdump|grep '%s'|grep -v grep|awk '{print $2}'" % path
+        prog = "tcpdump"
     elif _sniff_command == "dumpcap":
-        cmd = "ps -ef|grep dumpcap|grep '%s'|grep -v grep|awk '{print $2}'" % path
+        prog = "dumpcap"
     else:
         raise RuntimeError("请检查系统是否存在命令：dumpcap 或者 tcpdump")
-    response = exec_cmd_subprocess(args=cmd)
-    if response["code"]:
-        return False
-    elif response["stdout"].strip():
-        return True
-    else:
-        return False
+
+    # pgrep -x 精确匹配进程名；prog 是内部常量，非客户端输入
+    response = exec_cmd_subprocess(args=f"pgrep -x {shlex.quote(prog)}")
+    pids = []
+    if response["code"] == 0:
+        for token in response["stdout"].split():
+            if not token.isdigit():
+                continue
+            pid = int(token)
+            if _pid_matches(pid, prog, path):
+                pids.append(pid)
+    if pids:
+        return True, pids
+    return False, []
 
 def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue=True):
     global _sniff_command
@@ -70,24 +160,32 @@ def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue
     else:
         logger.info(f"跳过网卡 {eth} 单队列配置")
 
-    cmd = f"rm -rf {path}"
-    exec_cmd_subprocess(args=cmd)
+    # 用 list args + shell=False 执行，避免 path/extended/eth 被客户端注入 shell 元字符
+    # （path/extended 来自客户端 JSON，shell=True 拼接会有命令注入风险）
+    exec_cmd_subprocess(args=["rm", "-rf", path], shell=False)
+    # socket_server 以 root 运行（systemd），tcpdump/dumpcap 无需 sudo。
     if _sniff_command == "tcpdump":
-        cmd = "sudo tcpdump -i %s -w %s %s -Z root" % (eth, path, extended)
+        cmd = ["tcpdump", "-i", eth, "-w", path]
+        if extended:
+            # extended 是 BPF 过滤表达式，按空白拆成 argv tokens（与原 shell 词法分割等价）
+            cmd.extend(extended.split())
+        cmd += ["-Z", "root"]
     elif _sniff_command == "dumpcap":
-        cmd = "sudo dumpcap -i %s -w %s -f '%s'" % (eth, path, extended)
+        cmd = ["dumpcap", "-i", eth, "-w", path]
+        if extended:
+            cmd += ["-f", extended]  # -f 取单个 arg，extended 作为整体传入
     else:
         raise RuntimeError("请检查系统是否存在命令：dumpcap 或者 tcpdump")
 
     # 使用taskset绑定抓包进程到对应CPU，避免跨CPU数据传输导致乱序
     if bound_cpu is not None:
-        cmd = f"taskset -c {bound_cpu} {cmd}"
+        cmd = ["taskset", "-c", str(bound_cpu)] + cmd
         logger.info(f"抓包进程绑定到 CPU {bound_cpu}")
 
-    logger.info(cmd)
-    exec_cmd_subprocess(args=cmd, wait=False)
+    logger.info(" ".join(shlex.quote(c) for c in cmd))
+    exec_cmd_subprocess(args=cmd, shell=False, wait=False)
     time.sleep(2)
-    if tcpdump_isrun(path=path):
+    if tcpdump_isrun(path=path)[0]:
         return True
     else:
         return False
@@ -105,10 +203,28 @@ class Tcpdump_scapy:
 
     def _sniff(self):
         from scapy.all import sniff, wrpcap
-        self.e = False
-        # self.pkts = sniff(iface=self.iface, count=0, prn=lambda x: x.sprintf('{IP:%IP.src%->%IP.dst%}'),filter=self.filter, stop_filter=lambda x: self.e, timeout=self.timeout) # 进行抓包操作
-        self.pkts = sniff(iface=self.iface, count=0, prn=lambda x: x.sprintf('{IP:%IP.src%->%IP.dst%}'),
-                          filter=self.filter, stop_filter=lambda x: self.e, timeout=self.timeout)  # 进行抓包操作
+        self.pkts = []
+        # 注意：不在此重置 self.e=False —— __init__ 已初始化为 False。
+        # 若 start()→stop() 竞态在冷导入期间已把 self.e 置 True，
+        # 保留 True 让 while 循环直接跳过，避免覆盖停止信号。
+        # 分段 sniff：每轮最多阻塞 1 秒，确保无包到达时也能及时检查 stop_filter。
+        # scapy 的 stop_filter 仅在收到包时触发，单次长 timeout 会让 stop() 卡死。
+        # 总时长受 self.timeout 约束（None 表示一直抓到 stop 为止）。
+        start = time.time()
+        while not self.e:
+            if self.timeout is not None:
+                elapsed = time.time() - start
+                if elapsed >= self.timeout:
+                    break
+                remain = min(1, self.timeout - elapsed)
+            else:
+                remain = 1
+            pkts = sniff(iface=self.iface, count=0,
+                         prn=lambda x: x.sprintf('{IP:%IP.src%->%IP.dst%}'),
+                         filter=self.filter, stop_filter=lambda x: self.e,
+                         timeout=remain)
+            if pkts:
+                self.pkts.extend(pkts)
         if self.path:
             wrpcap(self.path, self.pkts)
 
@@ -121,12 +237,12 @@ class Tcpdump_scapy:
         self.e = True
         t1 = time.time()
         while time.time() - t1 < 30:
-            if self.mythread.is_alive():
-                logger.info("停止抓包进程，进制存活状态:%s" % self.mythread.is_alive())
-                time.sleep(1)
-            else:
-                return
-        raise RuntimeError("停止抓包进程失败！")
+            if not self.mythread.is_alive():
+                return True
+            logger.info("停止抓包进程，线程存活状态:%s" % self.mythread.is_alive())
+            time.sleep(1)
+        logger.error("停止抓包进程失败：30秒超时")
+        return False
 
 class SingleQueueRxThread:
     """
