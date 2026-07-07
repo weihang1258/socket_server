@@ -2,6 +2,18 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.3.9] — 2026-07-07
+
+**兼容 DPI 版本：v1.0.7.0**
+
+### 紧急修复：ETag 缓存变量未 global 导致 list/upgrade 崩溃
+
+- **根因**：`get_releases()` / `get_latest()` 引用模块级 ETag 缓存变量 `_releases_etag` / `_releases_cache` / `_latest_etag` 时未声明 `global`，Python 将其视为局部变量。首次调用无异常（变量被赋值而非读取），第二次及并发调用时报 `local variable referenced before assignment`。
+- **影响**：v1.3.7 所有依赖 `get_releases()`/`get_latest()` 的功能（`socket_server list`、`socket_server upgrade`、自动升级下载阶段）均崩溃。
+- **修复**：`get_releases()` 和 `get_latest()` 内添加对应 `global` 声明。
+
+---
+
 ## [1.3.8] — 2026-07-07
 
 **兼容 DPI 版本：v1.0.7.0**

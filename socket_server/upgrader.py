@@ -105,6 +105,7 @@ def get_latest_version_raw():
 
 def get_releases():
     """获取 GitHub 所有 Release 列表（带 ETag，304 不计限额）"""
+    global _releases_etag, _releases_cache
     try:
         headers = _github_headers()
         if _releases_etag:
@@ -136,7 +137,7 @@ def get_releases():
 
 def get_latest():
     """获取最新 Release（带 ETag，304 不计限额）"""
-    global _latest_cache
+    global _latest_etag, _latest_cache
     try:
         url = f"{GITHUB_API}/latest"
         headers = _github_headers()
