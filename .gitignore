@@ -7,3 +7,4 @@ dist/
 !packaging/*.spec
 .vscode/
 *.egg-info/
+packaging/Python-*.tgz
