@@ -118,34 +118,16 @@ def _find_sha256_asset(assets):
 def _download_file(url, dest_path):
     """下载文件到指定路径，支持大文件流式写入。
 
-    失败时若 config 配置了代理，则用代理重试一次（systemd 服务不继承 shell
-    的 http_proxy，直连失败是代理网络的常见情况）。
+    代理取自 /opt/socket/config 的 proxy= 字段（实时读取）。请求失败不重试，
+    由调用方决定下个周期再试。
     """
     proxies = _get_proxies()
-    logger.info(f"下载: {url} -> {dest_path}")
-    try:
-        resp = requests.get(url, stream=True, timeout=300, headers=_github_headers(), proxies=proxies)
-        resp.raise_for_status()
-        with open(dest_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-        return
-    except Exception as e:
-        # 若首次已用代理仍失败，则无重试必要
-        if proxies:
-            logger.error(f"下载失败（已使用代理 {proxies['http']}）: {e}")
-            raise
-        logger.warning(f"直连下载失败: {e}")
-        proxy = _read_proxy()
-        if not proxy:
-            raise
-        logger.info(f"使用代理重试: {proxy}")
-        resp = requests.get(url, stream=True, timeout=300, headers=_github_headers(),
-                            proxies={"http": proxy, "https": proxy})
-        resp.raise_for_status()
-        with open(dest_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
+    logger.info(f"下载: {url} -> {dest_path}" + (f" (via proxy {proxies['http']})" if proxies else " (直连)"))
+    resp = requests.get(url, stream=True, timeout=300, headers=_github_headers(), proxies=proxies)
+    resp.raise_for_status()
+    with open(dest_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            f.write(chunk)
 
 
 def _verify_sha256(filepath, sha256_url):
