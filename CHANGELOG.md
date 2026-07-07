@@ -2,6 +2,20 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.3.7] — 2026-07-07
+
+**兼容 DPI 版本：v1.0.7.0**
+
+### 解决 GitHub 未认证 API 60 次/小时共享限额（upgrader.py / autoupgrade.py）
+
+内网多靶机共享同一出口 IP，GitHub 未认证 API 限额 60 次/小时易耗尽（403）。本次用两个不依赖 token 的方案彻底规避：
+
+- **方案 1 — raw 文件查版本**：新增 `get_latest_version_raw()`，自动升级检查时从 `raw.githubusercontent.com/.../version.py` 读版本号（走 CDN，**不占 API 限额**）。仅在确认有新版需下载时才调 API 拿 asset 信息。
+- **方案 2 — ETag 条件请求**：`get_latest()` / `get_releases()` 缓存响应的 `ETag`，后续请求带 `If-None-Match`，未变化返回 **304（不计入限额）**。
+- 自动升级流程：raw 查版本 → 比对 → 有新版才调 `get_latest()` 拿 asset → 下载。日常检查零限额消耗。
+
+---
+
 ## [1.3.6] — 2026-07-07
 
 **兼容 DPI 版本：v1.0.7.0**

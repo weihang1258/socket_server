@@ -14,7 +14,14 @@ from .supervisor import VERSIONS_DIR, CONFIG_PATH, service_restart
 logger = logging.getLogger("socket_server")
 
 GITHUB_API = f"https://api.github.com/repos/{REPO}/releases"
+RAW_VERSION_URL = f"https://raw.githubusercontent.com/{REPO}/main/socket_server/version.py"
 INSTALL_DIR = "/opt/socket"
+
+# ETag 缓存：带 If-None-Match 请求，304 响应不计入 GitHub API 限额
+_latest_etag = None
+_latest_cache = None
+_releases_etag = None
+_releases_cache = []
 
 
 def _read_proxy():
@@ -55,11 +62,39 @@ def _github_headers():
     return headers
 
 
-def get_releases():
-    """获取 GitHub 所有 Release 列表"""
+def get_latest_version_raw():
+    """从 raw.githubusercontent.com 读 version.py 解析最新版本号。
+
+    走 CDN，不占 GitHub API 限额。返回版本号字符串或 None。
+    仅用于自动升级的版本探测；确认有新版后调 get_latest() 拿 asset 信息。
+    """
     try:
-        resp = requests.get(GITHUB_API, timeout=10, headers=_github_headers(), proxies=_get_proxies())
+        resp = requests.get(RAW_VERSION_URL, timeout=10, headers=_github_headers(), proxies=_get_proxies())
         resp.raise_for_status()
+        for line in resp.text.splitlines():
+            line = line.strip()
+            if line.startswith("VERSION") and "=" in line:
+                val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                return val or None
+        logger.error("raw version.py 未解析到 VERSION")
+        return None
+    except Exception as e:
+        logger.error(f"读取 raw version 失败: {e}")
+        return None
+
+
+def get_releases():
+    """获取 GitHub 所有 Release 列表（带 ETag，304 不计限额）"""
+    try:
+        headers = _github_headers()
+        if _releases_etag:
+            headers["If-None-Match"] = _releases_etag
+        resp = requests.get(GITHUB_API, timeout=10, headers=headers, proxies=_get_proxies())
+        if resp.status_code == 304:
+            logger.debug("Releases 未变化 (304)")
+            return _releases_cache or []
+        resp.raise_for_status()
+        _releases_etag = resp.headers.get("ETag")
         releases = resp.json()
         result = []
         for r in releases:
@@ -71,27 +106,36 @@ def get_releases():
                 "notes": r.get("body", "") or "",
                 "assets": r.get("assets", []),
             })
+        _releases_cache[:] = result
         return result
     except Exception as e:
         logger.error(f"获取 GitHub Releases 失败: {e}")
-        return []
+        return _releases_cache or []
 
 
 def get_latest():
-    """获取最新 Release"""
+    """获取最新 Release（带 ETag，304 不计限额）"""
     try:
         url = f"{GITHUB_API}/latest"
-        resp = requests.get(url, timeout=10, headers=_github_headers(), proxies=_get_proxies())
+        headers = _github_headers()
+        if _latest_etag:
+            headers["If-None-Match"] = _latest_etag
+        resp = requests.get(url, timeout=10, headers=headers, proxies=_get_proxies())
+        if resp.status_code == 304:
+            logger.debug("latest Release 未变化 (304)")
+            return _latest_cache
         resp.raise_for_status()
         r = resp.json()
         tag = r.get("tag_name", "").lstrip("v")
         if not tag:
             return None
-        return {
+        result = {
             "version": tag,
             "notes": r.get("body", "") or "",
             "assets": r.get("assets", []),
         }
+        _latest_etag = resp.headers.get("ETag")
+        return result
     except Exception as e:
         logger.error(f"获取最新 Release 失败: {e}")
         return None

@@ -6,7 +6,7 @@ import threading
 from packaging.version import Version
 
 from .version import VERSION
-from .upgrader import get_latest, is_version_downloaded, download_version, switch_to
+from .upgrader import get_latest, get_latest_version_raw, is_version_downloaded, download_version, switch_to
 from .supervisor import VERSIONS_DIR, CONFIG_PATH
 
 logger = logging.getLogger("socket_server")
@@ -69,14 +69,12 @@ def _autoupgrade_loop():
                 _auto_stop_event.wait(CHECK_INTERVAL)
                 continue
 
-            # 检查最新版
-            latest = get_latest()
-            if not latest:
+            # 检查最新版：先用 raw 文件查版本号（走 CDN，不占 API 限额）
+            new_ver = get_latest_version_raw()
+            if not new_ver:
                 logger.debug("无法获取最新版本信息")
                 _auto_stop_event.wait(CHECK_INTERVAL)
                 continue
-
-            new_ver = latest["version"]
 
             # 版本比较
             if Version(new_ver) <= Version(VERSION):
@@ -86,9 +84,14 @@ def _autoupgrade_loop():
 
             logger.info(f"发现新版本: v{new_ver}")
 
-            # 下载（如果未下载）
+            # 下载（如果未下载）——此时才调 API 拿 asset 信息
             if not is_version_downloaded(new_ver):
                 logger.info(f"正在下载版本 v{new_ver}...")
+                latest = get_latest()
+                if not latest or latest["version"] != new_ver:
+                    logger.error(f"获取版本 v{new_ver} 的 asset 信息失败，等下次重试")
+                    _auto_stop_event.wait(CHECK_INTERVAL)
+                    continue
                 if not download_version(new_ver, latest["assets"]):
                     logger.error(f"版本 v{new_ver} 下载失败，等下次重试")
                     _auto_stop_event.wait(CHECK_INTERVAL)
