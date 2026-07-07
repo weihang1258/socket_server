@@ -1,4 +1,5 @@
 import os
+import sys
 import subprocess
 import shutil
 import gzip
@@ -35,14 +36,27 @@ def _clean_subprocess_env(env):
     """清除 PyInstaller 打包注入的环境变量，避免污染子进程。
 
     socket_server 是 PyInstaller 打包的二进制，运行时会把临时解包目录(_MEIxxxx)
-    注入 LD_LIBRARY_PATH。若子进程继承该变量，会优先从临时目录加载错误版本的
-    动态库（如 libcrypto/libssl），导致外部程序启动崩溃——实例：DPI 的 xsa 因
-    加载到打包的 libcrypto.so.1.1 而启动即崩，被 dpi_monitor 反复重启。
-    同时清除 _PYI_* 内部变量。保留 PATH/JAVA_HOME/LANG 等子进程可能需要的变量。
+    注入多个环境变量。若子进程继承这些指向临时目录的变量，会出两类问题：
+    1. 加载错误版本动态库——DPI 的 xsa 因 LD_LIBRARY_PATH 指向 _MEI 而加载到
+       打包的 libcrypto.so.1.1(OpenSSL 1.1.1f)，启动即崩，被 dpi_monitor 反复重启；
+    2. 持有失效路径——_MEI 目录在 socket_server 退出即删，长驻子进程(如 dpi_monitor)
+       继承的 PLAYWRIGHT_BROWSERS_PATH=/tmp/_MEIxxxx/ms-playwright 变成悬空引用。
+
+    清理策略：
+    - 移除 LD_LIBRARY_PATH（显式，即便非打包模式也清）；
+    - 移除所有 _PYI_* 内部变量（前缀匹配）；
+    - 移除任何值以 sys._MEIPASS 开头的变量（覆盖 PLAYWRIGHT_BROWSERS_PATH 及未来
+      新增的同源变量，无需逐个枚举）。
+    PATH 显式保留——子进程找命令靠它；即便其值引用了 _MEIPASS 也不动。
+    进程内代码(如 playwright)仍可直接读 os.environ，不受影响：本函数只改传给
+    子进程的环境副本，不修改 os.environ。
     """
     env = dict(os.environ if env is None else env)
+    meipass = getattr(sys, "_MEIPASS", None)
     for k in list(env.keys()):
         if k == "LD_LIBRARY_PATH" or k.startswith("_PYI_"):
+            del env[k]
+        elif k != "PATH" and meipass and isinstance(env[k], str) and env[k].startswith(meipass):
             del env[k]
     return env
 
