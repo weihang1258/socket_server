@@ -2,6 +2,19 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.3.3] — 2026-07-07
+
+**兼容 DPI 版本：v1.0.7.0**
+
+### 修复自动升级切换失效（supervisor.py / cli.py）
+
+- **根因**：`_find_current_binary()` 用 `os.path.realpath()` 把 `versions/current` 符号链接解析成具体版本目录（如 `/opt/socket/versions/1.3.0`），写入 systemd unit 的 `ExecStart` 成为硬编码版本路径。`switch_to()` 切换符号链接后 `systemctl restart` 仍按 unit 里写死的旧路径启动，导致自动升级"切换成功、重启后版本不变"的死循环。
+- **修复 1**：`_find_current_binary()` 不再 `realpath` 解析，直接返回 `versions/current/socket_server`，使 unit 的 `ExecStart` 指向稳定的 `current` 链接，切换链接后重启即生效。
+- **修复 2（自愈）**：新增 `ensure_unit_correct()`，在 `cmd_serve` 启动时检查 unit 文件的 `ExecStart` 是否指向 `current` 链接，若不是（历史版本写死的路径）则自动重写 + `daemon-reload`。已部署靶机升级到本版本后，下次重启即自愈，无需手动 `enable`。
+- 重构：抽取 `_write_unit()` 供 `service_enable` 与 `ensure_unit_correct` 复用。
+
+---
+
 ## [1.3.2] — 2026-07-06
 
 **兼容 DPI 版本：v1.0.7.0**

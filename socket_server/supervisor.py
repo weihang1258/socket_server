@@ -41,15 +41,11 @@ def _ensure_dirs():
             f.write("autoupgrade=on\n")
 
 
-def service_enable():
-    """安装 systemd unit 并启用开机自启"""
-    _ensure_dirs()
-    # 找到当前二进制
-    exec_path = _find_current_binary()
-    if not exec_path:
-        logger.error("找不到 socket_server 二进制，请先部署")
-        return False
+EXPECTED_EXEC = os.path.join(VERSIONS_DIR, "current", "socket_server")
 
+
+def _write_unit(exec_path):
+    """写入 systemd unit 文件并 daemon-reload，返回是否成功"""
     content = UNIT_CONTENT.format(exec_path=exec_path)
     try:
         with open(UNIT_PATH, "w") as f:
@@ -57,14 +53,51 @@ def service_enable():
     except PermissionError:
         logger.error(f"写入 {UNIT_PATH} 需要 root 权限")
         return False
-
     _systemctl("daemon-reload")
+    return True
+
+
+def service_enable():
+    """安装 systemd unit 并启用开机自启"""
+    _ensure_dirs()
+    exec_path = _find_current_binary()
+    if not exec_path:
+        logger.error("找不到 socket_server 二进制，请先部署")
+        return False
+
+    if not _write_unit(exec_path):
+        return False
+
     rc, _, err = _systemctl("enable", SERVICE_NAME)
     if rc != 0:
         logger.error(f"enable 失败: {err}")
         return False
     logger.info(f"已安装 systemd unit 并启用开机自启")
     return True
+
+
+def ensure_unit_correct():
+    """启动时自愈：若 unit 的 ExecStart 未指向 current 链接则重写。
+
+    历史版本曾用 os.path.realpath 把 current 链接解析成具体版本目录写进 unit，
+    导致 switch_to 切换符号链接后 systemctl restart 仍跑旧版本。本函数在每次
+    serve 启动时检查并修正，使旧靶机升级到本版本后下次重启即自愈。
+    """
+    if not os.path.isfile(EXPECTED_EXEC) or not os.access(EXPECTED_EXEC, os.X_OK):
+        return  # current 链接无效，交给 service_enable 处理
+
+    try:
+        with open(UNIT_PATH) as f:
+            existing = f.read()
+    except FileNotFoundError:
+        return  # unit 不存在，不在此创建（避免非部署场景误写）
+
+    expected_content = UNIT_CONTENT.format(exec_path=EXPECTED_EXEC)
+    if existing.strip() == expected_content.strip():
+        return  # 已正确，无需改动
+
+    if _write_unit(EXPECTED_EXEC):
+        logger.info(f"已修正 systemd unit ExecStart -> {EXPECTED_EXEC}（自愈）")
 
 
 def service_disable():
@@ -114,14 +147,12 @@ def is_service_active():
 
 
 def _find_current_binary():
-    """找到当前运行的二进制路径"""
-    # 优先找 versions/current 链接
+    """找到当前运行的二进制路径（返回 current 符号链接路径，不解析）"""
+    # 返回 current 符号链接路径，这样 switch_to 更新链接后重启即可生效
     current_link = os.path.join(VERSIONS_DIR, "current")
-    if os.path.islink(current_link):
-        target = os.path.realpath(current_link)
-        binary = os.path.join(target, "socket_server")
-        if os.path.isfile(binary) and os.access(binary, os.X_OK):
-            return binary
+    binary = os.path.join(current_link, "socket_server")
+    if os.path.isfile(binary) and os.access(binary, os.X_OK):
+        return binary
 
     # fallback: /opt/socket/socket_server
     fallback = os.path.join(INSTALL_DIR, "socket_server")

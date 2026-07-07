@@ -14,6 +14,14 @@ def cmd_serve(args):
 
     setup_environment()
 
+    # 启动时自愈：修正历史版本写死版本路径的 systemd unit
+    try:
+        from .supervisor import ensure_unit_correct
+        ensure_unit_correct()
+    except Exception as e:
+        logger = logging.getLogger("socket_server")
+        logger.warning(f"unit 自愈检查失败（不影响服务）: {e}")
+
     # 将 do 函数注入到 CombinedHandler
     from .server import TrackedTCPHandler
     # 动态给 MyTCPHandler 添加 on_data 实现
