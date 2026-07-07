@@ -2,6 +2,19 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.3.8] — 2026-07-07
+
+**兼容 DPI 版本：v1.0.7.0**
+
+### 请求日志增加代理标识 + raw 失败重试（upgrader.py）
+
+- **新增 `_proxy_tag()`**：所有请求日志末尾统一显示 `(via proxy http://...)` 或 `(直连)`，一眼判断是否走代理。支持 config 和 env 两种代理来源。
+- **raw 重试**：`get_latest_version_raw()` 失败后最多重试 2 次（间隔 2s/4s）。raw 不占 API 限额，重试无成本，扛偶发抖动。
+- **修复 `_latest_cache` 未赋值**：`get_latest()` 304 分支返回的 `_latest_cache` 在首次成功时未保存，导致缓存始终为 None。
+- 所有请求日志（get_releases / get_latest / _download_file / _verify_sha256 / show_current）统一使用 `_proxy_tag()` 标识代理状态。
+
+---
+
 ## [1.3.7] — 2026-07-07
 
 **兼容 DPI 版本：v1.0.7.0**

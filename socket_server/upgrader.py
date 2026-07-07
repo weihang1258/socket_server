@@ -53,6 +53,18 @@ def _get_proxies():
     return None
 
 
+def _proxy_tag():
+    """返回当前请求使用的代理标识字符串，用于日志"""
+    proxy = _read_proxy()
+    if proxy:
+        return f"(via proxy {proxy})"
+    env_proxy = os.environ.get("https_proxy") or os.environ.get("http_proxy") or \
+                os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+    if env_proxy:
+        return f"(via env proxy {env_proxy})"
+    return "(直连)"
+
+
 def _github_headers():
     """构建 GitHub API 请求头，如果环境变量有 GITHUB_TOKEN 则带上认证"""
     headers = {"Accept": "application/vnd.github+json"}
@@ -65,22 +77,30 @@ def _github_headers():
 def get_latest_version_raw():
     """从 raw.githubusercontent.com 读 version.py 解析最新版本号。
 
-    走 CDN，不占 GitHub API 限额。返回版本号字符串或 None。
+    走 CDN，不占 GitHub API 限额，故失败可重试。返回版本号字符串或 None。
     仅用于自动升级的版本探测；确认有新版后调 get_latest() 拿 asset 信息。
     """
-    try:
-        resp = requests.get(RAW_VERSION_URL, timeout=10, headers=_github_headers(), proxies=_get_proxies())
-        resp.raise_for_status()
-        for line in resp.text.splitlines():
-            line = line.strip()
-            if line.startswith("VERSION") and "=" in line:
-                val = line.split("=", 1)[1].strip().strip('"').strip("'")
-                return val or None
-        logger.error("raw version.py 未解析到 VERSION")
-        return None
-    except Exception as e:
-        logger.error(f"读取 raw version 失败: {e}")
-        return None
+    last_err = None
+    for attempt in range(1, 4):  # 最多 3 次，间隔递增
+        try:
+            logger.info(f"读取 raw version {RAW_VERSION_URL} {_proxy_tag()} (第{attempt}次)")
+            resp = requests.get(RAW_VERSION_URL, timeout=8, headers=_github_headers(), proxies=_get_proxies())
+            resp.raise_for_status()
+            for line in resp.text.splitlines():
+                line = line.strip()
+                if line.startswith("VERSION") and "=" in line:
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    return val or None
+            logger.error("raw version.py 未解析到 VERSION")
+            return None
+        except Exception as e:
+            last_err = e
+            logger.warning(f"读取 raw version 失败 {_proxy_tag()} (第{attempt}次): {e}")
+            if attempt < 3:
+                import time as _t
+                _t.sleep(2 * attempt)  # 2s, 4s
+    logger.error(f"读取 raw version 最终失败 {_proxy_tag()}: {last_err}")
+    return None
 
 
 def get_releases():
@@ -91,9 +111,10 @@ def get_releases():
             headers["If-None-Match"] = _releases_etag
         resp = requests.get(GITHUB_API, timeout=10, headers=headers, proxies=_get_proxies())
         if resp.status_code == 304:
-            logger.debug("Releases 未变化 (304)")
+            logger.info(f"获取 Releases {resp.status_code} {_proxy_tag()} (未变化)")
             return _releases_cache or []
         resp.raise_for_status()
+        logger.info(f"获取 Releases {resp.status_code} {_proxy_tag()}")
         _releases_etag = resp.headers.get("ETag")
         releases = resp.json()
         result = []
@@ -109,12 +130,13 @@ def get_releases():
         _releases_cache[:] = result
         return result
     except Exception as e:
-        logger.error(f"获取 GitHub Releases 失败: {e}")
+        logger.error(f"获取 GitHub Releases 失败 {_proxy_tag()}: {e}")
         return _releases_cache or []
 
 
 def get_latest():
     """获取最新 Release（带 ETag，304 不计限额）"""
+    global _latest_cache
     try:
         url = f"{GITHUB_API}/latest"
         headers = _github_headers()
@@ -122,9 +144,10 @@ def get_latest():
             headers["If-None-Match"] = _latest_etag
         resp = requests.get(url, timeout=10, headers=headers, proxies=_get_proxies())
         if resp.status_code == 304:
-            logger.debug("latest Release 未变化 (304)")
+            logger.info(f"获取 latest Release {resp.status_code} {_proxy_tag()} (未变化)")
             return _latest_cache
         resp.raise_for_status()
+        logger.info(f"获取 latest Release {resp.status_code} {_proxy_tag()}")
         r = resp.json()
         tag = r.get("tag_name", "").lstrip("v")
         if not tag:
@@ -135,9 +158,10 @@ def get_latest():
             "assets": r.get("assets", []),
         }
         _latest_etag = resp.headers.get("ETag")
+        _latest_cache = result
         return result
     except Exception as e:
-        logger.error(f"获取最新 Release 失败: {e}")
+        logger.error(f"获取最新 Release 失败 {_proxy_tag()}: {e}")
         return None
 
 
@@ -166,7 +190,7 @@ def _download_file(url, dest_path):
     由调用方决定下个周期再试。
     """
     proxies = _get_proxies()
-    logger.info(f"下载: {url} -> {dest_path}" + (f" (via proxy {proxies['http']})" if proxies else " (直连)"))
+    logger.info(f"下载: {url} -> {dest_path} {_proxy_tag()}")
     resp = requests.get(url, stream=True, timeout=300, headers=_github_headers(), proxies=proxies)
     resp.raise_for_status()
     with open(dest_path, "wb") as f:
@@ -177,6 +201,7 @@ def _download_file(url, dest_path):
 def _verify_sha256(filepath, sha256_url):
     """校验文件 sha256"""
     try:
+        logger.info(f"获取 sha256 校验文件 {sha256_url} {_proxy_tag()}")
         resp = requests.get(sha256_url, timeout=10, headers=_github_headers(), proxies=_get_proxies())
         resp.raise_for_status()
         expected = resp.text.strip().split()[0]  # 格式: "hash  filename"
@@ -195,7 +220,7 @@ def _verify_sha256(filepath, sha256_url):
             logger.error(f"sha256 校验失败: 期望 {expected}, 实际 {actual}")
             return False
     except Exception as e:
-        logger.warning(f"sha256 校验跳过（无法获取校验文件）: {e}")
+        logger.warning(f"sha256 校验跳过（无法获取校验文件） {_proxy_tag()}: {e}")
         return True  # 无校验文件时跳过校验
 
 
@@ -378,10 +403,11 @@ def show_current():
     # 尝试获取当前版本的 notes
     try:
         url = f"{GITHUB_API}/tags/v{VERSION}"
+        logger.info(f"获取版本说明 {url} {_proxy_tag()}")
         resp = requests.get(url, timeout=5, headers=_github_headers(), proxies=_get_proxies())
         if resp.status_code == 200:
             notes = resp.json().get("body", "")
             if notes:
                 print(f"\n版本说明:\n{notes}")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"获取版本说明失败 {_proxy_tag()}: {e}")
