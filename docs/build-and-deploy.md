@@ -183,7 +183,11 @@ sudo /opt/socket/versions/current/socket_server switch <版本号>
 配置文件位置：`/opt/socket/config`，内容：
 ```
 autoupgrade=on
+proxy=http://10.12.186.204:7897
 ```
+
+`proxy` 字段可选。systemd 启动的服务不继承 shell 的 `http_proxy` 环境变量，
+内网代理环境下需在此显式配置，自动升级/手动升级下载才会走代理。下载失败时会用此代理自动重试一次。
 
 ## 8. 发版流程（开发者）
 

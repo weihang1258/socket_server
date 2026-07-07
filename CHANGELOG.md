@@ -2,6 +2,20 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.3.4] — 2026-07-07
+
+**兼容 DPI 版本：v1.0.7.0**
+
+### 升级下载代理支持（upgrader.py）
+
+- **背景**：systemd 启动的服务不继承 shell 的 `http_proxy`/`https_proxy` 环境变量，内网代理环境下自动升级下载 GitHub Release 会直连失败。
+- **新增**：`/opt/socket/config` 支持 `proxy=http://host:port` 字段。所有 GitHub API 请求与二进制下载显式带上该代理。
+- **失败重试**：`_download_file` 直连失败后，若 config 配置了 `proxy=`，自动用代理重试一次。
+- **优先级**：config `proxy=` 优先；未配置时回退环境变量（适用于手动 `socket_server upgrade` 等非 systemd 场景）。
+- 更新 `docs/build-and-deploy.md` 说明 `proxy` 配置项。
+
+---
+
 ## [1.3.3] — 2026-07-07
 
 **兼容 DPI 版本：v1.0.7.0**

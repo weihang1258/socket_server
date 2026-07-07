@@ -9,12 +9,41 @@ import requests
 from packaging.version import Version
 
 from .version import VERSION, REPO
-from .supervisor import VERSIONS_DIR, service_restart
+from .supervisor import VERSIONS_DIR, CONFIG_PATH, service_restart
 
 logger = logging.getLogger("socket_server")
 
 GITHUB_API = f"https://api.github.com/repos/{REPO}/releases"
 INSTALL_DIR = "/opt/socket"
+
+
+def _read_proxy():
+    """从 /opt/socket/config 读取 proxy= 字段，返回代理 URL 或 None。
+
+    systemd 启动的服务不继承 shell 环境变量，故 http_proxy 等无法靠 env 透传。
+    改由 config 文件显式配置，例如: proxy=http://10.12.186.204:7897
+    """
+    try:
+        if not os.path.isfile(CONFIG_PATH):
+            return None
+        with open(CONFIG_PATH, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("proxy="):
+                    val = line.split("=", 1)[1].strip()
+                    return val or None
+    except Exception:
+        pass
+    return None
+
+
+def _get_proxies():
+    """构造 requests 用的 proxies 字典：优先 config 文件，其次环境变量兜底"""
+    proxy = _read_proxy()
+    if proxy:
+        return {"http": proxy, "https": proxy}
+    # 兜底：环境变量（非 systemd 启动时，如手动 socket_server upgrade）
+    return None
 
 
 def _github_headers():
@@ -29,7 +58,7 @@ def _github_headers():
 def get_releases():
     """获取 GitHub 所有 Release 列表"""
     try:
-        resp = requests.get(GITHUB_API, timeout=10, headers=_github_headers())
+        resp = requests.get(GITHUB_API, timeout=10, headers=_github_headers(), proxies=_get_proxies())
         resp.raise_for_status()
         releases = resp.json()
         result = []
@@ -52,7 +81,7 @@ def get_latest():
     """获取最新 Release"""
     try:
         url = f"{GITHUB_API}/latest"
-        resp = requests.get(url, timeout=10, headers=_github_headers())
+        resp = requests.get(url, timeout=10, headers=_github_headers(), proxies=_get_proxies())
         resp.raise_for_status()
         r = resp.json()
         tag = r.get("tag_name", "").lstrip("v")
@@ -87,19 +116,42 @@ def _find_sha256_asset(assets):
 
 
 def _download_file(url, dest_path):
-    """下载文件到指定路径，支持大文件流式写入"""
+    """下载文件到指定路径，支持大文件流式写入。
+
+    失败时若 config 配置了代理，则用代理重试一次（systemd 服务不继承 shell
+    的 http_proxy，直连失败是代理网络的常见情况）。
+    """
+    proxies = _get_proxies()
     logger.info(f"下载: {url} -> {dest_path}")
-    resp = requests.get(url, stream=True, timeout=300, headers=_github_headers())
-    resp.raise_for_status()
-    with open(dest_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192):
-            f.write(chunk)
+    try:
+        resp = requests.get(url, stream=True, timeout=300, headers=_github_headers(), proxies=proxies)
+        resp.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+        return
+    except Exception as e:
+        # 若首次已用代理仍失败，则无重试必要
+        if proxies:
+            logger.error(f"下载失败（已使用代理 {proxies['http']}）: {e}")
+            raise
+        logger.warning(f"直连下载失败: {e}")
+        proxy = _read_proxy()
+        if not proxy:
+            raise
+        logger.info(f"使用代理重试: {proxy}")
+        resp = requests.get(url, stream=True, timeout=300, headers=_github_headers(),
+                            proxies={"http": proxy, "https": proxy})
+        resp.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
 
 
 def _verify_sha256(filepath, sha256_url):
     """校验文件 sha256"""
     try:
-        resp = requests.get(sha256_url, timeout=10, headers=_github_headers())
+        resp = requests.get(sha256_url, timeout=10, headers=_github_headers(), proxies=_get_proxies())
         resp.raise_for_status()
         expected = resp.text.strip().split()[0]  # 格式: "hash  filename"
         h = hashlib.sha256()
@@ -300,7 +352,7 @@ def show_current():
     # 尝试获取当前版本的 notes
     try:
         url = f"{GITHUB_API}/tags/v{VERSION}"
-        resp = requests.get(url, timeout=5, headers=_github_headers())
+        resp = requests.get(url, timeout=5, headers=_github_headers(), proxies=_get_proxies())
         if resp.status_code == 200:
             notes = resp.json().get("body", "")
             if notes:
