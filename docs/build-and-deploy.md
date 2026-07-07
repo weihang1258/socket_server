@@ -3,8 +3,8 @@
 ## 1. 环境要求
 
 - OS: CentOS 7/8 或 Ubuntu 18.04+ (x86_64)
-- Python: 3.8+
-- 网络: 能访问 github.com 和 pypi.org（或使用内网镜像）
+- glibc: ≥ 2.17（二进制最高需 `GLIBC_2.14`，CentOS 7.5 原生支持）
+- 网络: 能访问 github.com 和 pypi.org（或使用内网代理，见第 7 节）
 
 ## 2. 获取代码
 
@@ -30,73 +30,66 @@ cd /opt/socket_server
 git pull
 ```
 
-## 3. 创建打包虚拟环境
+## 3. 打包环境（CentOS 7 容器）
+
+> ⚠️ **重要**：打包机的 glibc 必须 **≤ 目标靶机的 glibc**。Ubuntu 20.04（glibc 2.31）打的二进制在 CentOS 7.5（glibc 2.17）上会因 `GLIBC_2.29 not found` 启动崩溃。必须用 CentOS 7 系环境打包。
+
+项目提供 `packaging/Dockerfile.builder`，基于 CentOS 7 自编译 Python 3.8 `--enable-shared`，产物最高仅需 `GLIBC_2.14`，兼容 CentOS 7/8、Ubuntu 18.04+。
+
+### 3.1 构建打包镜像（一次性）
 
 ```bash
-# 安装 Python3（如果未安装），CentOS 示例
-sudo yum install -y python3
-
-# 在项目目录下创建虚拟环境
 cd /opt/socket_server
-python3 -m venv venv
 
-# 激活虚拟环境
-source venv/bin/activate
+# 下载 Python 源码到 packaging/（容器内不下载，避免代理问题）
+wget -q https://mirrors.tuna.tsinghua.edu.cn/python/3.8.10/Python-3.8.10.tgz \
+  -O packaging/Python-3.8.10.tgz
+
+# 构建镜像（约 3-5 分钟，含 Python 编译）
+docker build --network host \
+  -t socket_server-builder:centos7-py38 \
+  -f packaging/Dockerfile.builder packaging/
 ```
 
-## 4. 安装依赖
+构建成功后镜像可反复用，后续打包秒级启动。
 
-有代理：
-```bash
-pip3 install -i https://pypi.tuna.tsinghua.edu.cn/simple \
-    --proxy http://10.12.186.204:7897 \
-    --upgrade pip
+> Docker daemon 若需走代理拉镜像/装包，参考 `packaging/Dockerfile.builder` 内的 yum proxy 与 pip `--proxy` 配置，按实际代理地址修改。
 
-pip3 install -i https://pypi.tuna.tsinghua.edu.cn/simple \
-    --proxy http://10.12.186.204:7897 \
-    -r requirements.txt
-```
-
-无代理（直连）：
-```bash
-pip3 install --upgrade pip
-pip3 install -r requirements.txt
-```
-
-依赖清单（requirements.txt）：
-```
-scapy
-requests
-psutil
-wheel
-pyinstaller
-pyppeteer
-packaging
-```
-
-> 如果 pyppeteer 安装失败（需要 chromium 下载），可以先跳过：`pip3 install scapy requests psutil wheel pyinstaller packaging`
-
-## 5. 打包
+## 4. 打包
 
 ```bash
-# 确保虚拟环境已激活
-source venv/bin/activate
+cd /opt/socket_server
 
-# 查看当前版本号
-python3 -c "from socket_server.version import VERSION; print(VERSION)"
+# 清理旧产物
+rm -rf dist build
 
-# 执行打包（使用 spec 文件）
-pyinstaller packaging/socket_server.spec --clean
-```
+# 容器内打包（挂载项目目录，产物直接落到宿主 dist/）
+docker run --rm \
+  -v /opt/socket_server:/work \
+  -w /work \
+  socket_server-builder:centos7-py38 \
+  sh -c '
+    pip3 install --proxy http://10.12.186.204:7897 \
+      -i https://pypi.tuna.tsinghua.edu.cn/simple \
+      scapy requests psutil wheel pyinstaller packaging pyppeteer
+    pyinstaller packaging/socket_server.spec --clean --noconfirm
+  '
 
-打包过程约 1-3 分钟，产物在 `dist/` 目录下：
-
-```bash
+# 查看产物
 ls -lh dist/socket_server
-# -rwxr-xr-x 1 root root 30M socket_server
+# -rwxr-xr-x 1 root root 16M socket_server
+
+# 验证 glibc 需求（应 ≤ 2.17，CentOS 7.5 能跑）
+docker run --rm -v /opt/socket_server:/work socket_server-builder:centos7-py38 \
+  sh -c 'readelf -V /work/dist/socket_server 2>/dev/null | grep -oE "GLIBC_[0-9.]+" | sort -u -V | tail -3'
+
+# 验证版本号
+./dist/socket_server current
 ```
 
-这是单个可执行文件，无外部依赖，可直接部署。
+产物为单文件可执行，无外部 Python 依赖，可直接部署。
+
+> 依赖清单见 `requirements.txt`：scapy、requests、psutil、wheel、pyinstaller、pyppeteer、packaging。pyppeteer 若装失败可先跳过（运行时按需用）。
 
 ## 6. 部署
 
@@ -117,6 +110,8 @@ sudo chmod +x /opt/socket/versions/$VER/socket_server
 sudo ln -sf /opt/socket/versions/$VER /opt/socket/versions/current
 
 # 安装 systemd 服务 + 开机自启
+# enable 会把 ExecStart 写成 /opt/socket/versions/current/socket_server（指向 current 链接）
+# 这样后续 switch_to 切换链接后重启即可生效
 sudo /opt/socket/versions/current/socket_server enable
 
 # 启动服务
@@ -189,36 +184,73 @@ proxy=http://10.12.186.204:7897
 `proxy` 字段可选。systemd 启动的服务不继承 shell 的 `http_proxy` 环境变量，
 内网代理环境下需在此显式配置，自动升级/手动升级下载才会走代理。下载失败时会用此代理自动重试一次。
 
-## 8. 发版流程（开发者）
+### 7.3 从 v1.3.2 及更早版本升级（一次性手动恢复）
 
-在开发机上发布新版本到 GitHub：
+v1.3.2 及更早版本的 `enable` 会把 systemd unit 的 `ExecStart` 写死成具体版本路径（如 `/opt/socket/versions/1.3.0/socket_server`），导致 `switch_to` 切换符号链接后重启仍跑旧版本，自动升级陷入"切换成功、重启后版本不变"的死循环。
+
+v1.3.3+ 修复了此问题，且 `serve` 启动时会自愈检查并重写错误的 unit。但旧版本卡在循环里无法自动切到新版，需手动执行一次：
 
 ```bash
+# 1. 确认新版已下载到磁盘（autoupgrade 会自动下载，或手动 switch 触发下载）
+ls /opt/socket/versions/1.3.4/socket_server
+
+# 2. 用新版二进制重写 systemd unit（指向 current 链接）
+sudo /opt/socket/versions/1.3.4/socket_server enable
+
+# 3. 重启
+sudo systemctl restart socket_server
+
+# 4. 验证已切到新版
+/opt/socket/versions/current/socket_server current
+```
+
+执行一次后，新版启动时 `ensure_unit_correct()` 会确认 unit 正确，**今后所有自动升级全程自愈，无需再手动介入**。
+
+## 8. 发版流程（开发者）
+
+在打包机上发布新版本到 GitHub：
+
+```bash
+cd /opt/socket_server
+
 # 1. 更新版本号
 #    编辑 socket_server/version.py，修改 VERSION = "新版本号"
+#    并在 CHANGELOG.md 顶部补充本版变更
 
 # 2. 提交并推送
-git add socket_server/version.py
+git add socket_server/version.py CHANGELOG.md
 git commit -m "release: v新版本号"
 git push
 
-# 3. 在 Linux 打包机上拉取最新代码并打包
-cd /opt/socket_server
-git pull
-source venv/bin/activate
-pyinstaller packaging/socket_server.spec --clean
+# 3. 打 tag 并推送
+git tag -a v新版本号 -m "v新版本号 — 变更摘要"
+git push origin v新版本号
 
-# 4. 读取版本号
-VER=$(python3 -c "from socket_server.version import VERSION; print(VERSION)")
+# 4. 容器打包（见第 4 节）
+rm -rf dist build
+docker run --rm -v /opt/socket_server:/work -w /work \
+  socket_server-builder:centos7-py38 \
+  sh -c 'pip3 install --proxy http://10.12.186.204:7897 \
+      -i https://pypi.tuna.tsinghua.edu.cn/simple \
+      scapy requests psutil wheel pyinstaller packaging pyppeteer && \
+    pyinstaller packaging/socket_server.spec --clean --noconfirm'
 
 # 5. 生成 sha256 校验
 sha256sum dist/socket_server > dist/socket_server.sha256
 
-# 6. 创建 GitHub Release（需要 gh CLI 或在网页操作）
-gh release create v$VER dist/socket_server dist/socket_server.sha256 \
-    --title "v$VER" \
-    --notes "版本更新说明"
+# 6. 创建 GitHub Release（本机 gh 不是标准 GitHub CLI，用 API 上传）
+#    从 CHANGELOG 提取本版 notes，调用 releases API 创建并上传 assets
+python3 <<'PY'
+import json, os, re, urllib.request
+# token 从 ~/.git-credentials 读取（credential.helper=store 已配置）
+with open(os.path.expanduser('~/.git-credentials')) as f:
+    token = re.search(r'ghp_[A-Za-z0-9]+', f.read()).group()
+VER = "新版本号"   # ← 改成实际版本号
+# ... 读 CHANGELOG 取 notes，POST /releases，再 POST upload_url 上传二进制和 sha256
+PY
 ```
+
+> 第 6 步也可在 GitHub 网页直接操作：Releases → Draft a new release → 选 tag → 粘贴 CHANGELOG notes → 上传 `dist/socket_server` 和 `dist/socket_server.sha256`。
 
 靶机上的 `socket_server upgrade` 或自动升级线程会自动检测到新版本。
 
