@@ -178,6 +178,15 @@ def do(datatype, data: bytes, **kwargs):
 
         chromium_path = data.get("chromium_path", "/opt/socket/chrome-linux/chrome")
 
+        # chromium 不存在时自动下载（用到才触发，失败则给出手动下载方法）
+        if not (os.path.isfile(chromium_path) and os.access(chromium_path, os.X_OK)):
+            logger.info(f"chromium 不存在: {chromium_path}，尝试自动下载...")
+            from .boce import ensure_chromium
+            if not ensure_chromium(chromium_path):
+                res = json.dumps({"error": "chromium 自动下载失败，请查看日志中的手动下载方法"}).encode("utf-8")
+                res = struct.pack("i", len(res)) + res
+                return res
+
         test_result = exec_cmd_subprocess(
             args=[chromium_path, "--headless", "--no-sandbox", "--disable-gpu", "--dump-dom", "about:blank"],
             shell=False, use_run=True

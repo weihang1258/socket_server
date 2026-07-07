@@ -76,6 +76,117 @@ _nic_cpu_binding = {}  # 网卡 -> CPU 映射
 _allocated_cpus = set()  # 已分配的CPU集合
 _cpu_binding_lock = threading.Lock()  # 线程锁
 
+# chromium 自动下载相关
+CHROME_INSTALL_DIR = "/opt/socket/chrome-linux"
+NPMMIRROR_BASE = "https://registry.npmmirror.com/-/binary/chromium-browser-snapshots/Linux_x64"
+
+
+def _read_config_proxy():
+    """从 /opt/socket/config 读 proxy= 字段，复用 upgrader 的约定"""
+    try:
+        with open("/opt/socket/config") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("proxy="):
+                    val = line.split("=", 1)[1].strip()
+                    return val or None
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_latest_chromium_revision():
+    """查询 npmmirror Linux_x64 目录，返回最新的 revision 号（字符串）"""
+    proxies = {"http": p, "https": p} if (p := _read_config_proxy()) else None
+    resp = requests.get(NPMMIRROR_BASE + "/", timeout=20, proxies=proxies)
+    resp.raise_for_status()
+    entries = resp.json()
+    revs = [e["name"].rstrip("/") for e in entries if e["name"].rstrip("/").isdigit()]
+    if not revs:
+        raise RuntimeError("npmmirror 未返回任何 chromium revision")
+    return max(revs, key=int)
+
+
+def _download_chromium_zip(revision, dest_zip):
+    """下载指定 revision 的 chrome-linux.zip 到 dest_zip"""
+    proxies = {"http": p, "https": p} if (p := _read_config_proxy()) else None
+    url = f"{NPMMIRROR_BASE}/{revision}/chrome-linux.zip"
+    logger.info(f"下载 chromium r{revision}: {url}")
+    resp = requests.get(url, stream=True, timeout=300, proxies=proxies)
+    resp.raise_for_status()
+    with open(dest_zip, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=65536):
+            f.write(chunk)
+
+
+def _print_manual_download_hint(revision):
+    """下载失败时打印手动下载方法"""
+    hint = (
+        "\n========== chromium 自动下载失败，请手动下载 ==========\n"
+        f"1. 在能联网的机器下载:\n"
+        f"   wget {NPMMIRROR_BASE}/{revision}/chrome-linux.zip\n"
+        f"   (或浏览器打开上述 URL)\n"
+        f"2. 解压到靶机 {CHROME_INSTALL_DIR} (最终路径需为 {CHROME_INSTALL_DIR}/chrome):\n"
+        f"   mkdir -p /opt/socket && cd /opt/socket\n"
+        f"   unzip chrome-linux.zip   # 解压出 chrome-linux/ 目录\n"
+        f"3. 赋予执行权限:\n"
+        f"   chmod +x {CHROME_INSTALL_DIR}/chrome\n"
+        f"4. 验证:\n"
+        f"   {CHROME_INSTALL_DIR}/chrome --headless --no-sandbox --dump-dom about:blank\n"
+        f"======================================================"
+    )
+    logger.error(hint)
+    print(hint)
+
+
+def ensure_chromium(chromium_path=CHROME_INSTALL_DIR + "/chrome"):
+    """确保 chromium 可执行文件存在，不存在则自动下载。
+
+    返回 True 表示可用（已存在或下载成功），False 表示下载失败需手动处理。
+    线程安全：用 _browser_lock 复用，避免并发拨测重复下载。
+    """
+    if os.path.isfile(chromium_path) and os.access(chromium_path, os.X_OK):
+        return True
+
+    with _browser_lock:
+        # double-check：可能在等锁期间已被其他线程下载好
+        if os.path.isfile(chromium_path) and os.access(chromium_path, os.X_OK):
+            return True
+
+        try:
+            revision = _fetch_latest_chromium_revision()
+            logger.info(f"npmmirror 最新 chromium revision: {revision}")
+        except Exception as e:
+            logger.error(f"查询 chromium 最新版本失败: {e}")
+            _print_manual_download_hint("latest")
+            return False
+
+        import tempfile
+        staging = tempfile.mkdtemp(prefix="chrome_dl_")
+        dest_zip = os.path.join(staging, "chrome-linux.zip")
+        try:
+            _download_chromium_zip(revision, dest_zip)
+            logger.info(f"chromium 下载完成，开始解压到 {CHROME_INSTALL_DIR}...")
+            # 解压：zip 内顶层是 chrome-linux/，解压到 /opt/socket/ 得到 /opt/socket/chrome-linux/
+            import zipfile
+            parent = os.path.dirname(CHROME_INSTALL_DIR)
+            with zipfile.ZipFile(dest_zip) as zf:
+                zf.extractall(parent)
+            os.chmod(chromium_path, 0o755)
+            if os.path.isfile(chromium_path) and os.access(chromium_path, os.X_OK):
+                logger.info(f"chromium 安装成功: {chromium_path}")
+                return True
+            logger.error(f"解压后未找到可执行的 chrome: {chromium_path}")
+            _print_manual_download_hint(revision)
+            return False
+        except Exception as e:
+            logger.error(f"chromium 自动下载失败: {e}")
+            _print_manual_download_hint(revision)
+            return False
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+
 # 全局 event loop 和 browser
 _global_loop = None
 _browser = None

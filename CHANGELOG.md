@@ -2,6 +2,22 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.3.5] — 2026-07-07
+
+**兼容 DPI 版本：v1.0.7.0**
+
+### chromium 按需自动下载（boce.py / handlers.py）
+
+- **背景**：拨测（datatype 131）依赖 chromium，此前要求人工预先部署到 `/opt/socket/chrome-linux/chrome`，缺失时直接报错。
+- **新增**：`ensure_chromium()` —— 拨测触发时若 chromium 不存在则自动下载，用到才下，不阻塞服务启动。
+- **下载源**：npmmirror 镜像（`registry.npmmirror.com/-/binary/chromium-browser-snapshots/Linux_x64`），动态查询最新 revision，下载 `chrome-linux.zip` 解压到 `/opt/socket/chrome-linux/`。
+- **代理支持**：复用 `/opt/socket/config` 的 `proxy=` 配置，内网环境下载走代理。
+- **失败兜底**：下载失败时在日志和标准输出打印手动下载方法（含完整 wget/解压/chmod 步骤）。
+- **线程安全**：用 `_browser_lock` 防止并发拨测重复下载。
+- 缺依赖库的自动安装逻辑（yum/apt-get）保持不变，在 chromium 存在但缺 so 时触发。
+
+---
+
 ## [1.3.4] — 2026-07-07
 
 **兼容 DPI 版本：v1.0.7.0**
