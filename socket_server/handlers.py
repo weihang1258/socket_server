@@ -11,7 +11,7 @@ from .netutils import (
     wait_until, wait_not_until, ensure_command,
     compress_gzip, decompress_gzip, unzip, python_cmd
 )
-from .capture import tcpdump_start, tcpdump_stop, Tcpdump_scapy
+from .capture import tcpdump_start, tcpdump_stop  # Tcpdump_scapy 已弃用，不再 import（见 datatype 121/122/123 注释）
 from .boce import BoceChecker
 from .socket_listen import SocketServerListen
 from .pcap_flow import extract_pcap_flow_five_tuples
@@ -20,14 +20,14 @@ from .replayer import PcapReplayer
 logger = logging.getLogger(__name__)
 
 # 模块级全局状态（延迟初始化）
-tcpdump_scapy = None
+# tcpdump_scapy = None  # 已弃用：原 scapy 内置抓包单实例全局变量。见 datatype 121/122/123 注释。
 ss = None
 boce = None  # 延迟初始化，避免 import 时依赖 chromium
 cache_sendpkts = None
 
 
 def do(datatype, data: bytes, **kwargs):
-    global tcpdump_scapy, ss, cache_sendpkts
+    global ss, cache_sendpkts  # tcpdump_scapy 已弃用，移出 global 声明
 
     # scapy 发包
     if datatype == 0:
@@ -141,35 +141,46 @@ def do(datatype, data: bytes, **kwargs):
         res = json.dumps({"res": response}).encode("utf-8")
         return res
 
-    # 开始抓包
-    elif datatype == 121:
-        data = json.loads(s=data)
-        logger.info("开始抓包，类型：%s，参数：%s" % (datatype, data))
-        tcpdump_scapy = Tcpdump_scapy(**data)
-        tcpdump_scapy.start()
-        return b"ok"
-
-    # 停止抓包
-    elif datatype == 122:
-        logger.info("停止抓包，类型：%s" % datatype)
-        if tcpdump_scapy is None:
-            return json.dumps({"error": "未在抓包"}).encode("utf-8")
-        ok = tcpdump_scapy.stop()
-        if ok:
-            return b"ok"
-        return json.dumps({"error": "停止抓包进程失败"}).encode("utf-8")
-
-    # 下载pcap包
-    elif datatype == 123:
-        logger.info("下载pcap包，类型：%s" % datatype)
-        if tcpdump_scapy is None:
-            return json.dumps({"error": "未在抓包"}).encode("utf-8")
-        from scapy.all import PcapWriter
-        with BytesIO() as fl:
-            PcapWriter(fl).write(tcpdump_scapy.pkts)
-            fl.seek(0)
-            content = fl.read()
-            return struct.pack("<Q", len(content)) + content
+    # ========== 已弃用：scapy 内置抓包（datatype 121/122/123） ==========
+    # 这套基于全局单实例 Tcpdump_scapy（capture.py 中的类）：
+    #   - handlers 模块级变量 tcpdump_scapy 只有一份，第二次 start 会覆盖前一个，
+    #     导致前一个抓包对象丢失、pcap 取不回、stop 只能停当前那个。
+    #   - 不支持同靶机并发抓包（哪怕不同网卡/不同路径）。
+    # 业务实际使用的是 datatype 5/6（tcpdump 命令行那套，tcpdump_start/stop），
+    # 靠"不同网卡 + 不同 pcap 路径"区分多个 tcpdump 进程，天然支持并发。
+    # 故 121/122/123 整段停用，Tcpdump_scapy 类也一并注释（见 capture.py）。
+    # 如需恢复，取消本段注释 + capture.py 中类的注释 + handlers 顶部 import/global。
+    # ----------------------------------------------------------------
+    # # 开始抓包
+    # elif datatype == 121:
+    #     data = json.loads(s=data)
+    #     logger.info("开始抓包，类型：%s，参数：%s" % (datatype, data))
+    #     tcpdump_scapy = Tcpdump_scapy(**data)
+    #     tcpdump_scapy.start()
+    #     return b"ok"
+    #
+    # # 停止抓包
+    # elif datatype == 122:
+    #     logger.info("停止抓包，类型：%s" % datatype)
+    #     if tcpdump_scapy is None:
+    #         return json.dumps({"error": "未在抓包"}).encode("utf-8")
+    #     ok = tcpdump_scapy.stop()
+    #     if ok:
+    #         return b"ok"
+    #     return json.dumps({"error": "停止抓包进程失败"}).encode("utf-8")
+    #
+    # # 下载pcap包
+    # elif datatype == 123:
+    #     logger.info("下载pcap包，类型：%s" % datatype)
+    #     if tcpdump_scapy is None:
+    #         return json.dumps({"error": "未在抓包"}).encode("utf-8")
+    #     from scapy.all import PcapWriter
+    #     with BytesIO() as fl:
+    #         PcapWriter(fl).write(tcpdump_scapy.pkts)
+    #         fl.seek(0)
+    #         content = fl.read()
+    #         return struct.pack("<Q", len(content)) + content
+    # ================================================================
 
     # 拨测开始
     elif datatype == 131:

@@ -190,59 +190,70 @@ def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue
     else:
         return False
 
-class Tcpdump_scapy:
-    def __init__(self, iface, filter=None, path=None, timeout=5):  # 初始化有__不知道为啥不显示
-        self.path = path
-        self.iface = iface  # 本地网卡名
-        self.filter = filter  # 过滤条件
-        self.timeout = timeout
-        self.e = False
-        self.pkts = list()
-        if not self.iface:
-            self.iface = routeinfo()["0.0.0.0"]["Iface"]
-
-    def _sniff(self):
-        from scapy.all import sniff, wrpcap
-        self.pkts = []
-        # 注意：不在此重置 self.e=False —— __init__ 已初始化为 False。
-        # 若 start()→stop() 竞态在冷导入期间已把 self.e 置 True，
-        # 保留 True 让 while 循环直接跳过，避免覆盖停止信号。
-        # 分段 sniff：每轮最多阻塞 1 秒，确保无包到达时也能及时检查 stop_filter。
-        # scapy 的 stop_filter 仅在收到包时触发，单次长 timeout 会让 stop() 卡死。
-        # 总时长受 self.timeout 约束（None 表示一直抓到 stop 为止）。
-        start = time.time()
-        while not self.e:
-            if self.timeout is not None:
-                elapsed = time.time() - start
-                if elapsed >= self.timeout:
-                    break
-                remain = min(1, self.timeout - elapsed)
-            else:
-                remain = 1
-            pkts = sniff(iface=self.iface, count=0,
-                         prn=lambda x: x.sprintf('{IP:%IP.src%->%IP.dst%}'),
-                         filter=self.filter, stop_filter=lambda x: self.e,
-                         timeout=remain)
-            if pkts:
-                self.pkts.extend(pkts)
-        if self.path:
-            wrpcap(self.path, self.pkts)
-
-    def start(self):  # 开始抓包
-        self.mythread = threading.Thread(target=self._sniff)
-        self.mythread.start()
-        # self.mythread.join()
-
-    def stop(self):
-        self.e = True
-        t1 = time.time()
-        while time.time() - t1 < 30:
-            if not self.mythread.is_alive():
-                return True
-            logger.info("停止抓包进程，线程存活状态:%s" % self.mythread.is_alive())
-            time.sleep(1)
-        logger.error("停止抓包进程失败：30秒超时")
-        return False
+# ========== 已弃用：Tcpdump_scapy 类 ==========
+# 基于 scapy 内置 sniff 的抓包实现。配套 handlers.py 的 datatype 121/122/123。
+# 弃用原因：
+#   - 全局单实例设计（handlers.py 的 tcpdump_scapy 模块变量只有一份），
+#     第二次 start 覆盖前一个，无法同靶机并发抓多个网卡/路径。
+#   - 业务实际用 datatype 5/6（tcpdump_start/stop 起独立 tcpdump 进程），
+#     靠"不同网卡 + 不同 pcap 路径"区分，天然支持并发，功能更全（BPF、CPU 绑定等）。
+# 保留代码注释备查，如需恢复取消本注释块。配套删除 handlers.py 的 121/122/123
+# 及顶部 import/global 声明（均已注释）。
+# ----------------------------------------------------------------
+# class Tcpdump_scapy:
+#     def __init__(self, iface, filter=None, path=None, timeout=5):  # 初始化有__不知道为啥不显示
+#         self.path = path
+#         self.iface = iface  # 本地网卡名
+#         self.filter = filter  # 过滤条件
+#         self.timeout = timeout
+#         self.e = False
+#         self.pkts = list()
+#         if not self.iface:
+#             self.iface = routeinfo()["0.0.0.0"]["Iface"]
+#
+#     def _sniff(self):
+#         from scapy.all import sniff, wrpcap
+#         self.pkts = []
+#         # 注意：不在此重置 self.e=False —— __init__ 已初始化为 False。
+#         # 若 start()→stop() 竞态在冷导入期间已把 self.e 置 True，
+#         # 保留 True 让 while 循环直接跳过，避免覆盖停止信号。
+#         # 分段 sniff：每轮最多阻塞 1 秒，确保无包到达时也能及时检查 stop_filter。
+#         # scapy 的 stop_filter 仅在收到包时触发，单次长 timeout 会让 stop() 卡死。
+#         # 总时长受 self.timeout 约束（None 表示一直抓到 stop 为止）。
+#         start = time.time()
+#         while not self.e:
+#             if self.timeout is not None:
+#                 elapsed = time.time() - start
+#                 if elapsed >= self.timeout:
+#                     break
+#                 remain = min(1, self.timeout - elapsed)
+#             else:
+#                 remain = 1
+#             pkts = sniff(iface=self.iface, count=0,
+#                          prn=lambda x: x.sprintf('{IP:%IP.src%->%IP.dst%}'),
+#                          filter=self.filter, stop_filter=lambda x: self.e,
+#                          timeout=remain)
+#             if pkts:
+#                 self.pkts.extend(pkts)
+#         if self.path:
+#             wrpcap(self.path, self.pkts)
+#
+#     def start(self):  # 开始抓包
+#         self.mythread = threading.Thread(target=self._sniff)
+#         self.mythread.start()
+#         # self.mythread.join()
+#
+#     def stop(self):
+#         self.e = True
+#         t1 = time.time()
+#         while time.time() - t1 < 30:
+#             if not self.mythread.is_alive():
+#                 return True
+#             logger.info("停止抓包进程，线程存活状态:%s" % self.mythread.is_alive())
+#             time.sleep(1)
+#         logger.error("停止抓包进程失败：30秒超时")
+#         return False
+# ================================================================
 
 class SingleQueueRxThread:
     """
