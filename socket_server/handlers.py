@@ -5,7 +5,7 @@ import shutil
 import logging
 from io import BytesIO
 
-from .version import VERSION
+from .version import VERSION, REPO
 from .netutils import (
     exec_cmd_subprocess, routeinfo, isfile, isdir, mkdir, mtu,
     wait_until, wait_not_until, ensure_command,
@@ -258,18 +258,21 @@ def do(datatype, data: bytes, **kwargs):
         res = json.dumps(response).encode("utf-8")
         return res
 
-    # 查询服务端版本详情
+    # 查询服务端版本详情（纯本地，不联网）
     elif datatype == 19:
         logger.info("查询服务端版本详情，类型：%s" % datatype)
-        from .upgrader import get_latest
-        info = {"version": VERSION, "repo": REPO}
         try:
-            latest = get_latest()
-            if latest:
-                info["latest_version"] = latest["version"]
-                info["has_upgrade"] = latest["version"] != VERSION
-        except Exception:
-            pass
+            from .release_notes import VERSION as _v, RELEASE_NOTES
+            info = {
+                "version": VERSION,
+                "repo": REPO,
+                "release_notes": RELEASE_NOTES,
+                "latest_version": _v,
+                "has_upgrade": _v != VERSION,
+            }
+        except ImportError:
+            # release_notes.py 未生成（非打包场景，如直接 python 运行）
+            info = {"version": VERSION, "repo": REPO, "release_notes": "", "latest_version": VERSION, "has_upgrade": False}
         res = json.dumps(info).encode("utf-8")
         return res
 

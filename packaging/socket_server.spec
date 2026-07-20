@@ -15,6 +15,12 @@ with open(version_file) as f:
     exec(f.read(), version_vars)
 VERSION = version_vars.get('VERSION', '0.0.0')
 
+# 打包前从 CHANGELOG.md 生成 release_notes.py（内置 notes，不联网）
+_notes_gen = os.path.join(ROOTDIR, 'packaging', 'generate_release_notes.py')
+if os.path.isfile(_notes_gen):
+    import subprocess
+    subprocess.run([sys.executable, _notes_gen], cwd=ROOTDIR, check=False)
+
 a = Analysis(
     [os.path.join(ROOTDIR, 'packaging', 'entry.py')],
     pathex=[ROOTDIR],
@@ -36,6 +42,7 @@ a = Analysis(
         'socket_server.upgrader',
         'socket_server.supervisor',
         'socket_server.autoupgrade',
+        'socket_server.release_notes',
         'scapy.all',
         'scapy.layers.l2',
         'scapy.layers.inet',

@@ -8,3 +8,4 @@ dist/
 .vscode/
 *.egg-info/
 packaging/Python-*.tgz
+socket_server/release_notes.py

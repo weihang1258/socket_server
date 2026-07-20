@@ -2,6 +2,21 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.4.0] — 2026-07-09
+
+**兼容 DPI 版本：v1.0.7.0**
+
+### release notes 打包内嵌，版本详情查询不再联网（handlers.py / packaging）
+
+- **背景**：`version_detail`（datatype 19）每次查询都调 GitHub API（`get_latest()`），占未认证 60 次/小时限额，且 `handlers.py` 未 import `REPO` 导致线上崩溃。
+- **修复 import**：`handlers.py` 顶部补 `from .version import VERSION, REPO`。
+- **内嵌 notes**：新增 `packaging/generate_release_notes.py`，打包前从 `CHANGELOG.md` 提取当前版本 notes，生成 `socket_server/release_notes.py`（`.gitignore` 不入库）。`version_detail(19)` 直接读本地模块，**完全不联网**，零限额消耗。
+- **notes 与版本绑定**：release notes 随二进制一起升级，天然同步，不会出现"版本 1.4.0 但 notes 是 1.3.9 的"。
+- 更新 `socket_server.spec`，打包前自动调用生成脚本 + 加 `release_notes` 到 hiddenimports。
+- datatype 19 不再 import `upgrader.get_latest`，断开与 GitHub API 的依赖。
+
+---
+
 ## [1.3.9] — 2026-07-07
 
 **兼容 DPI 版本：v1.0.7.0**
