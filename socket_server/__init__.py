@@ -36,17 +36,15 @@ _sniff_command = None
 
 
 def init_capture():
-    """检测抓包工具并同步到 capture/boce 模块"""
+    """抓包初始化。
+
+    抓包已改为进程内 AF_PACKET 实现（capture.py），不再依赖外部 tcpdump/dumpcap
+    二进制，也无需检测。保留本函数（setup_environment 调用）仅为接口稳定。
+    _sniff_command 仅由 setup_environment 用于日志展示，capture.py 内部不再读取。
+    """
     global _sniff_command
-    from .netutils import ensure_command
-    if ensure_command("dumpcap"):
-        _sniff_command = "dumpcap"
-    elif ensure_command("tcpdump"):
-        _sniff_command = "tcpdump"
-    from . import capture
-    capture._sniff_command = _sniff_command
-    from . import boce
-    boce._sniff_command = _sniff_command
+    _sniff_command = "afpacket"
+    logger.info("使用进程内 AF_PACKET 抓包（不依赖外部二进制）")
 
 
 def setup_environment():

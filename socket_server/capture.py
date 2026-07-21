@@ -1,14 +1,13 @@
 import os
 import time
 import struct
-import signal
-import shlex
+import socket
 import logging
 import threading
 
 logger = logging.getLogger(__name__)
 
-# 全局变量 抓包工具命令
+# 全局变量 抓包工具命令（保留供 __init__.init_capture 赋值，进程内 AF_PACKET 实现不再读取）
 _sniff_command = None
 
 # 全局变量 CPU绑定记录
@@ -16,178 +15,322 @@ _nic_cpu_binding = {}
 _allocated_cpus = set()
 _cpu_binding_lock = threading.Lock()
 
+# 进程内抓包实例注册表：path -> AFPacketCapture，支持同机多 path 并发抓包
+_captures = {}
+_captures_lock = threading.Lock()
 
-from .netutils import routeinfo, isfile, wait_not_until, wait_until, exec_cmd_subprocess
-def tcpdump_stop(path="/home/tmp/tmp.pcap"):
-    """停止抓包进程并确保 pcap 文件 flush 完成。
+# Linux AF_PACKET 相关 socket 常量（Python socket 模块未导出，用数值）
+ETH_P_ALL = 0x0003
+SOL_PACKET = 263
+PACKET_ADD_MEMBERSHIP = 1
+PACKET_MR_PROMISC = 1
+SO_TIMESTAMPNS = 35          # 内核纳秒时间戳
+SO_ATTACH_FILTER = 26        # 经典 BPF 过滤器
+DLT_EN10MB = 1               # Ethernet 链路类型
+PCAP_MAGIC_US_LE = 0xA1B2C3D4   # 微秒，小端（标准 libpcap TCPDUMP_MAGIC）
+PCAP_MAGIC_US_BE = 0xD4C3B2A1   # 微秒，大端（字节序互换）
+PCAP_MAGIC_NS_LE = 0xA1B23C4D   # 纳秒，小端
+PCAP_MAGIC_NS_BE = 0x4D3CB2A1   # 纳秒，大端
 
-    安全策略：PID 文件精确 kill → SIGINT/SIGTERM/SIGKILL 升级 → 轮询文件大小稳定。
-    不用 pkill -f 正则，避免 path 注入和 SIGKILL 误杀其他用户进程。
+
+from .netutils import routeinfo
+
+
+class AFPacketCapture:
+    """进程内 AF_PACKET 抓包：单线程 recv + 内核纳秒时间戳，直写 pcap。
+
+    设计要点：
+    - 不起子进程、不发信号、不查 PID：停止 = 关 socket + join 线程 + 关文件。
+      正常路径确定性；join 超时（线程仍存活）则不关文件避免写入竞态，返回 False 可重试。
+    - 不改网卡状态（队列/IRQ/RPS），靠抓完按时间戳稳定重排保序（见 _sort_pcap_by_timestamp）。
+    - 内核纳秒时间戳经 SO_TIMESTAMPNS 取回，落盘截断为微秒（兼容 replayer/pcap_flow 的 =IIII 解析）。
+    - promisc 默认开（兼容本机流量与 SPAN 镜像口），失败只 warn 不 abort。
+    - 每路抓包一个实例，按 path 注册到 _captures，天然支持同机多 path 并发。
     """
-    global _sniff_command
-    if _sniff_command == "tcpdump":
-        prog = "tcpdump"
-    elif _sniff_command == "dumpcap":
-        prog = "dumpcap"
-    else:
-        raise RuntimeError("请检查系统是否存在命令：dumpcap 或者 tcpdump")
 
-    # 幂等：进程已不在运行则直接成功
-    running, _ = tcpdump_isrun(path=path)
-    if not running:
-        return True
+    def __init__(self, eth, path, extended=""):
+        self.eth = eth
+        self.path = path
+        self.extended = (extended or "").strip()
+        self._sock = None
+        self._f = None
+        self._thread = None
+        self._stopped = threading.Event()
+        self._exc = None  # 收包线程内异常（start 后检查）
+        self._pkt_count = 0
+        self._dropped = 0
 
-    # 精确 kill PID，不依赖 pkill -f 正则（path 来自客户端不可信）。
-    # 每轮重新查询 PID，避免用过期 PID 误杀被回收的无关进程。
-    last_sig = None
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
-        last_sig = sig
-        running, pids = tcpdump_isrun(path=path)
-        if not running:
-            break
-        for pid in pids:
+    def _open(self):
+        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
+        s.bind((self.eth, 0))
+        # 纳秒时间戳：内核为每个包打 SO_TIMESTAMPNS，ancdata 取回
+        try:
+            s.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS, 1)
+        except OSError as e:
+            logger.warning(f"网卡 {self.eth} 不支持 SO_TIMESTAMPNS: {e}，回退到用户态时间戳（保序精度降低）")
+        # 增大接收缓冲，降低突发丢包
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+        except OSError:
+            pass
+        # promisc（兼容本机流量 + SPAN 镜像口）；失败不阻断
+        try:
+            ifindex = socket.if_nametoindex(self.eth)
+            mreq = struct.pack("IHH8s", ifindex, PACKET_MR_PROMISC, 0, b"")
+            s.setsockopt(SOL_PACKET, PACKET_ADD_MEMBERSHIP, mreq)
+        except OSError as e:
+            logger.warning(f"网卡 {self.eth} 开启 promisc 失败: {e}（仍可抓本机流量）")
+        # BPF 过滤（extended 非空时）：失败视为启动失败抛出，不静默抓全部流量
+        # （调用方明确要过滤，静默抓全部是行为错误且可能抓到非预期流量）
+        if self.extended:
             try:
-                os.kill(pid, sig)
-            except (ProcessLookupError, PermissionError):
-                pass  # 进程已退出
-        if wait_not_until(lambda: tcpdump_isrun(path=path)[0], expect_value=True,
-                          step=0.5, timeout=5):
-            break
+                from scapy.arch.linux import attach_filter
+                attach_filter(s, self.extended, self.eth)
+                logger.info(f"网卡 {self.eth} 已附加 BPF 过滤: {self.extended}")
+            except Exception as e:
+                raise RuntimeError(f"BPF 过滤编译失败({self.extended}): {e}") from e
+        # 阻塞 recv 加超时，让 stop 的 Event 能及时被检查到
+        s.settimeout(1.0)
+        self._sock = s
+        # pcap 全局头：微秒 magic，snaplen 65535，Ethernet
+        global_header = struct.pack("<IHHIIII", PCAP_MAGIC_US_LE, 2, 4, 0, 0, 65535, DLT_EN10MB)
+        self._f = open(self.path, "wb")
+        self._f.write(global_header)
+        self._f.flush()
 
-    running, _ = tcpdump_isrun(path=path)
-    if running:
-        logger.error("停止抓包进程失败：信号升级后进程仍存活")
-        return False
-    # SIGKILL 后给内核 0.5s 刷新 tcpdump/dumpcap 的 pcap 缓冲区，
-    # 确保未落盘的数据写入文件，再进入轮询。
-    if last_sig == signal.SIGKILL:
-        time.sleep(0.5)
+    def _recv_loop(self):
+        try:
+            while not self._stopped.is_set():
+                try:
+                    data, ancdata, _flags, _addr = self._sock.recvmsg(65535, 1024)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    # socket 已关闭，正常退出
+                    break
+                if not data:
+                    break
+                ts_ns = self._extract_ts_ns(ancdata)
+                self._write_packet(data, ts_ns)
+        except Exception as e:
+            self._exc = e
+            logger.exception(f"抓包线程异常 {self.eth} -> {self.path}")
+        finally:
+            self._read_stats()
 
-    # 等待 pcap 文件写完：轮询文件大小稳定（连续两次相同即 flush 完成），
-    # 最长等待 20 秒。比 os.path.getsize/os.access 的"非0即成功"可靠。
-    if isfile(path):
-        if _wait_file_stable(path, timeout=20):
-            return True
-        else:
+    def _extract_ts_ns(self, ancdata):
+        """从 ancdata 取 SO_TIMESTAMPNS 的 timespec(秒, 纳秒)，回退到 time.time_ns()。"""
+        for cmsg_level, cmsg_type, cmsg_data in ancdata:
+            if cmsg_level == socket.SOL_SOCKET and cmsg_type == SO_TIMESTAMPNS:
+                # struct timespec { time_t tv_sec; long tv_nsec; }，@ll 按平台 long 宽度对齐
+                tv_sec, tv_nsec = struct.unpack("@ll", cmsg_data)
+                return tv_sec * 1_000_000_000 + tv_nsec
+        return time.time_ns()
+
+    def _write_packet(self, data, ts_ns):
+        ts_sec = ts_ns // 1_000_000_000
+        ts_usec = (ts_ns % 1_000_000_000) // 1000
+        caplen = len(data)
+        # 记录头：微秒，小端（匹配 replayer/pcap_flow 的 =IIII）
+        self._f.write(struct.pack("<IIII", ts_sec, ts_usec, caplen, caplen))
+        self._f.write(data)
+        self._pkt_count += 1
+
+    def _read_stats(self):
+        # tpacket_stats = {u32 tp_packets; u32 tp_drops;} = 8 字节（非 3 个 u32）
+        try:
+            stats = self._sock.getsockopt(SOL_PACKET, 6, struct.calcsize("II"))
+            _pkts, _drops = struct.unpack("II", stats)
+            self._dropped = _drops
+            if _drops:
+                logger.warning(f"抓包 {self.eth} -> {self.path} 内核丢弃 {_drops} 包")
+        except (OSError, struct.error):
+            pass
+
+    def start(self):
+        self._open()
+        self._thread = threading.Thread(target=self._recv_loop, name=f"afpacket-{self.eth}", daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout=10):
+        self._stopped.set()
+        # _open 可能中途失败（bind/bad-BPF），此时 _sock/_thread 仍为 None，需防御
+        if self._sock is not None:
+            try:
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+        alive = self._thread is not None and self._thread.is_alive()
+        if alive:
+            # 线程未在超时内退出：不关闭文件，避免与仍在 _write_packet 的写入竞态
+            # （socket 已关闭，recv 会在下一次循环退出，但本轮写入不应被 close 打断）
+            logger.error(f"停止抓包线程超时(>{timeout}s)：{self.eth} -> {self.path}")
             return False
-    else:
+        # 线程已退出，安全 flush/close（替代旧的轮询文件大小稳定）
+        if self._f is not None:
+            try:
+                self._f.flush()
+                self._f.close()
+            except Exception:
+                pass
+        logger.info(f"抓包完成 {self.eth} -> {self.path}：{self._pkt_count} 包，内核丢弃 {self._dropped} 包")
         return True
 
 
-def _wait_file_stable(filepath, timeout=20):
-    """轮询文件大小直到连续两次相同（缓冲区已 flush），超时返回 False。"""
-    deadline = time.time() + timeout
-    prev_size = -1
-    while time.time() < deadline:
-        try:
-            cur_size = os.path.getsize(filepath)
-        except OSError:
-            time.sleep(0.5)
-            continue
-        if cur_size == prev_size and cur_size > 0:
-            return True
-        prev_size = cur_size
-        time.sleep(0.5)
-    return False
+def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue=False):
+    """开启抓包（进程内 AF_PACKET）。
 
-
-def _pid_matches(pid, prog, path):
-    """校验 pid 进程名 == prog 且 cmdline 含 path（字面子串，非正则）。
-    读取失败（进程已退出/权限不足）返回 False，避免 PID 回收后误杀。"""
-    try:
-        with open(f"/proc/{pid}/comm", "r") as f:
-            comm = f.read().strip()
-    except OSError:
-        return False
-    # comm 最多 15 字符，prog 可能被截断，用前缀兜底
-    if comm != prog and not prog.startswith(comm):
-        return False
-    if path:
-        try:
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", "replace")
-        except OSError:
+    签名兼容 datatype 5 / MCP capture_start：eth/path/extended/single_queue。
+    single_queue 默认 False（零网卡侵入）；显式 True 时才调 SingleQueueRxThread。
+    """
+    if not eth:
+        rt = routeinfo().get("0.0.0.0") or {}
+        eth = rt.get("Iface")
+        if not eth:
+            logger.error("未指定网卡且系统无默认路由，无法确定抓包网卡")
             return False
-        # path 作为字面子串匹配，不进 shell/正则，无注入
-        if path not in cmdline:
+
+    # 可选：单队列 + CPU 绑定（opt-in，默认不动网卡）
+    if single_queue:
+        logger.info(f"配置网卡 {eth} 为单队列模式（opt-in）")
+        try:
+            SingleQueueRxThread(eth=eth, count=1)
+        except Exception as e:
+            logger.warning(f"单队列配置失败(忽略，仍可抓包): {e}")
+
+    # 清旧文件
+    try:
+        if os.path.lexists(path):
+            os.remove(path)
+    except OSError as e:
+        logger.warning(f"清理旧 pcap {path} 失败: {e}")
+
+    # 同 path 已在抓：先停旧的（避免重复注册）
+    with _captures_lock:
+        old = _captures.get(path)
+    if old is not None:
+        logger.warning(f"path {path} 已有抓包在运行，先停止旧实例")
+        old.stop()
+        with _captures_lock:
+            _captures.pop(path, None)
+
+    cap = AFPacketCapture(eth=eth, path=path, extended=extended)
+    try:
+        cap.start()
+    except Exception as e:
+        logger.exception(f"启动抓包失败 {eth} -> {path}: {e}")
+        return False
+    # 起后短暂等待，确认线程存活且无异常（对照旧实现起后检查语义）
+    time.sleep(0.5)
+    if cap._thread is None or not cap._thread.is_alive():
+        logger.error(f"抓包线程未存活 {eth} -> {path}")
+        cap.stop()
+        return False
+    if cap._exc is not None:
+        logger.error(f"抓包线程启动即异常 {eth} -> {path}: {cap._exc}")
+        cap.stop()
+        return False
+    with _captures_lock:
+        _captures[path] = cap
+    logger.info(f"已开启抓包 {eth} -> {path}（extended={extended!r}, single_queue={single_queue}）")
+    return True
+
+
+def tcpdump_stop(path="/home/tmp/tmp.pcap"):
+    """停止抓包并按时间戳稳定重排 pcap。
+
+    幂等：path 未在抓直接返回 True。停止 = 关 socket + join 线程，无信号无 PID。
+    抓完调 _sort_pcap_by_timestamp 保证时间戳单调（根治多队列/RSS 乱序）。
+
+    停止失败（join 超时）：实例保留在 _captures 不移除，避免孤立线程泄漏；
+    调用方可重试 stop 直到成功。
+    """
+    with _captures_lock:
+        cap = _captures.get(path)
+    if cap is None:
+        return True  # 幂等：未在抓
+    ok = cap.stop()
+    if not ok:
+        # 保留注册表条目，调用方可重试 stop；isrun 仍返回 True
+        logger.error(f"停止抓包未完成（线程可能仍在运行），保留实例可重试：{path}")
+        return False
+    with _captures_lock:
+        _captures.pop(path, None)
+    # 抓完按时间戳稳定重排（核心保序步骤）
+    if os.path.isfile(path):
+        if not _sort_pcap_by_timestamp(path):
+            logger.error(f"pcap 时间戳重排失败，保留原文件：{path}")
             return False
     return True
 
 
 def tcpdump_isrun(path="/home/tmp/tmp.pcap"):
-    """返回 (running: bool, pids: list)。
-
-    pgrep -x 精确匹配进程名（prog 为内部常量，非客户端输入），再用
-    /proc/{pid}/cmdline 二次校验 path（字面子串）。既避免 pkill -f 把 path
-    当扩展正则（注入），也避免误杀同名但不属于本次抓包的 tcpdump/dumpcap 进程。
-    """
-    global _sniff_command
-    if _sniff_command == "tcpdump":
-        prog = "tcpdump"
-    elif _sniff_command == "dumpcap":
-        prog = "dumpcap"
-    else:
-        raise RuntimeError("请检查系统是否存在命令：dumpcap 或者 tcpdump")
-
-    # pgrep -x 精确匹配进程名；prog 是内部常量，非客户端输入
-    response = exec_cmd_subprocess(args=f"pgrep -x {shlex.quote(prog)}")
-    pids = []
-    if response["code"] == 0:
-        for token in response["stdout"].split():
-            if not token.isdigit():
-                continue
-            pid = int(token)
-            if _pid_matches(pid, prog, path):
-                pids.append(pid)
-    if pids:
-        return True, pids
+    """返回 (running, [path])。查 _captures 注册表，替代旧的 pgrep/proc 解析。"""
+    with _captures_lock:
+        cap = _captures.get(path)
+    if cap is not None and cap._thread is not None and cap._thread.is_alive():
+        return True, [path]
     return False, []
 
-def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue=True):
-    global _sniff_command
-    # if not ensure_command("tcpdump"):
-    #     raise RuntimeError("请检查系统是否存在命令：tcpdump")
-    if not eth:
-        eth = routeinfo()["0.0.0.0"]["Iface"]
-    # tcpdump_stop(path)
-    # mtu(eth,2000)
-    # 首次抓包需要配置网卡单队列模式
-    bound_cpu = None
-    if single_queue:
-        logger.info(f"配置网卡 {eth} 为单队列模式")
-        sq_handler = SingleQueueRxThread(eth=eth, count=1)
-        bound_cpu = sq_handler.bound_cpu  # 获取绑定的CPU号
-    else:
-        logger.info(f"跳过网卡 {eth} 单队列配置")
 
-    # 用 list args + shell=False 执行，避免 path/extended/eth 被客户端注入 shell 元字符
-    # （path/extended 来自客户端 JSON，shell=True 拼接会有命令注入风险）
-    exec_cmd_subprocess(args=["rm", "-rf", path], shell=False)
-    # socket_server 以 root 运行（systemd），tcpdump/dumpcap 无需 sudo。
-    if _sniff_command == "tcpdump":
-        cmd = ["tcpdump", "-i", eth, "-w", path]
-        if extended:
-            # extended 是 BPF 过滤表达式，按空白拆成 argv tokens（与原 shell 词法分割等价）
-            cmd.extend(extended.split())
-        cmd += ["-Z", "root"]
-    elif _sniff_command == "dumpcap":
-        cmd = ["dumpcap", "-i", eth, "-w", path]
-        if extended:
-            cmd += ["-f", extended]  # -f 取单个 arg，extended 作为整体传入
-    else:
-        raise RuntimeError("请检查系统是否存在命令：dumpcap 或者 tcpdump")
+def _sort_pcap_by_timestamp(path):
+    """按 pcap 记录头时间戳稳定重排，原子写覆盖。
 
-    # 使用taskset绑定抓包进程到对应CPU，避免跨CPU数据传输导致乱序
-    if bound_cpu is not None:
-        cmd = ["taskset", "-c", str(bound_cpu)] + cmd
-        logger.info(f"抓包进程绑定到 CPU {bound_cpu}")
+    仅处理微秒 magic（LE/BE）；纳秒/pcapng 等格式跳过（记 warn，不破坏文件）。
+    稳定排序：同时间戳保持原序（Python sorted 默认稳定）。
+    """
+    try:
+        with open(path, "rb") as f:
+            global_header = f.read(24)
+            if len(global_header) < 24:
+                logger.warning(f"pcap 全局头不完整，跳过重排：{path}")
+                return True
+            magic = struct.unpack("=I", global_header[:4])[0]
+            if magic == PCAP_MAGIC_US_LE:
+                endian = "<"
+            elif magic == PCAP_MAGIC_US_BE:
+                endian = ">"
+            elif magic in (PCAP_MAGIC_NS_LE, PCAP_MAGIC_NS_BE):
+                logger.warning(f"pcap 为纳秒格式(magic={hex(magic)})，跳过重排：{path}")
+                return True
+            else:
+                logger.warning(f"pcap magic 不识别({hex(magic)})，跳过重排：{path}")
+                return True
 
-    logger.info(" ".join(shlex.quote(c) for c in cmd))
-    exec_cmd_subprocess(args=cmd, shell=False, wait=False)
-    time.sleep(2)
-    if tcpdump_isrun(path=path)[0]:
+            records = []
+            idx = 0
+            while True:
+                hdr = f.read(16)
+                if len(hdr) < 16:
+                    break
+                ts_sec, ts_usec, incl_len, _orig_len = struct.unpack(endian + "IIII", hdr)
+                data = f.read(incl_len)
+                if len(data) < incl_len:
+                    logger.warning(f"pcap 末尾记录截断，已读取 {len(records)} 包：{path}")
+                    break
+                records.append((ts_sec, ts_usec, idx, data))
+                idx += 1
+
+        # 稳定排序：(ts_sec, ts_usec) 升序，同时间戳按原 idx 保持
+        records.sort(key=lambda r: (r[0], r[1], r[2]))
+
+        tmp = path + ".sorted"
+        with open(tmp, "wb") as f:
+            f.write(global_header)
+            for ts_sec, ts_usec, _idx, data in records:
+                f.write(struct.pack(endian + "IIII", ts_sec, ts_usec, len(data), len(data)))
+                f.write(data)
+        os.replace(tmp, path)
+        logger.info(f"pcap 时间戳重排完成：{path}（{len(records)} 包）")
         return True
-    else:
+    except Exception as e:
+        logger.exception(f"pcap 重排异常 {path}: {e}")
         return False
 
 # ========== 已弃用：Tcpdump_scapy 类 ==========
@@ -195,10 +338,8 @@ def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue
 # 弃用原因：
 #   - 全局单实例设计（handlers.py 的 tcpdump_scapy 模块变量只有一份），
 #     第二次 start 覆盖前一个，无法同靶机并发抓多个网卡/路径。
-#   - 业务实际用 datatype 5/6（tcpdump_start/stop 起独立 tcpdump 进程），
-#     靠"不同网卡 + 不同 pcap 路径"区分，天然支持并发，功能更全（BPF、CPU 绑定等）。
-# 保留代码注释备查，如需恢复取消本注释块。配套删除 handlers.py 的 121/122/123
-# 及顶部 import/global 声明（均已注释）。
+#   - 业务实际用 datatype 5/6（AFPacketCapture 进程内抓包），天然支持并发，保序更好。
+# 保留代码注释备查。配套 handlers.py 的 121/122/123 已整段注释。
 # ----------------------------------------------------------------
 # class Tcpdump_scapy:
 #     def __init__(self, iface, filter=None, path=None, timeout=5):  # 初始化有__不知道为啥不显示

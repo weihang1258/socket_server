@@ -44,6 +44,7 @@ a = Analysis(
         'socket_server.autoupgrade',
         'socket_server.release_notes',
         'scapy.all',
+        'scapy.arch.linux',
         'scapy.layers.l2',
         'scapy.layers.inet',
         'scapy.layers.inet6',

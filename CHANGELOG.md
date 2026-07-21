@@ -2,6 +2,39 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.5.0] — 2026-07-21
+
+**兼容 DPI 版本：v1.0.7.0**
+
+### 抓包重写：进程内 AF_PACKET + 时间戳稳定重排，根治乱序（capture.py / __init__.py / packaging）
+
+- **背景**：原 `tcpdump_start`/`tcpdump_stop` 起 tcpdump/dumpcap 子进程，靠 `SingleQueueRxThread` 改网卡单队列 + 绑 IRQ + 关 RPS/RFS 保序。实测仍乱序，且根因在内核多队列/RSS 跨 CPU 分发 AF_PACKET 写入顺序非确定——压单队列方案脆（`ethtool -L` 驱动不支持静默失败、mlx5 中断命名 grep 不到）、改网卡全局状态且 `tcpdump_stop` 不恢复（拖累同机业务、状态残留）。
+- **新实现 `AFPacketCapture`**：进程内 `AF_PACKET` socket + 单线程 `recvmsg` + 内核纳秒时间戳（`SO_TIMESTAMPNS`），直写微秒 pcap。停止 = 关 socket + join 线程 + 关文件，无信号/无 PID/无轮询。每路抓包独立实例按 path 注册到 `_captures`，天然支持同机多 path 并发。
+- **保序核心**：抓完调 `_sort_pcap_by_timestamp` 按记录头时间戳稳定重排（不赌内核写入顺序，只信内核打的时间戳）。纳秒精度内部排序，落盘截断为微秒（兼容 `replayer.py`/`pcap_flow.py` 的 `=IIII` 解析）。
+- **零网卡侵入**：`single_queue` 默认 `False`（原 `True`），默认不调 `ethtool`/不动 IRQ/不关 RPS-RFS；`SingleQueueRxThread` 保留为 opt-in。
+- **不依赖外部二进制**：不再需要靶机安装 tcpdump/dumpcap；`__init__.init_capture` 不再检测工具，`_sniff_command` 仅用于日志。
+- **BPF 过滤保留**：`extended` 非空时用 scapy `attach_filter`（libpcap ctypes 编译，无 shell），失败抛错不静默抓全部流量。
+- **spec**：hiddenimports 加 `scapy.arch.linux`（`attach_filter` 所在，PyInstaller 静态分析可能漏抓）。
+- **接口兼容**：`tcpdump_start(eth,path,extended,single_queue)`/`tcpdump_stop(path)`/`tcpdump_isrun(path)` 签名不变，datatype 5/6 透明。
+- **真实工具可读**：生成的 pcap magic 为标准 `0xA1B2C3D4`，`tcpdump -r`/`tshark`/`wireshark` 正常读取（旧内部消费者 replayer/pcap_flow 跳过 magic 校验，故未暴露）。
+
+### code review 修复（8 项，capture.py / __init__.py）
+
+- **pcap magic typo**：`PCAP_MAGIC_US_LE` 由 `0xA1B2C3D8` 改为标准 `0xA1B2C3D4`（末位 D4 非 D8，LE/BE 不自洽证明手误）。
+- **`_read_stats` 结构体错**：`tpacket_stats` 是 2 个 u32（8B），原用 `III`（12B）致 `struct.error` 未被 `except OSError` 捕获、recv 线程每次 stop 在 finally 崩溃、`_dropped` 恒 0。改 `II` + `except (OSError, struct.error)`。
+- **`tcpdump_stop` 孤立泄漏**：原先 pop 再 stop，停止超时则实例移出注册表但线程仍存活，重试幂等返回 True 永不停止。改为失败保留实例可重试、成功才 pop。
+- **`stop()` 写入竞态**：原 join 超时后仍 close 文件，与仍存活 recv 线程的 `write` 竞态。改为超时不关文件返回 False、线程退出后才 flush/close。
+- **无默认路由 TypeError**：`routeinfo()['0.0.0.0']['Iface']` 在无默认路由时 `None['Iface']` 抛 TypeError。改 `.get() or {}` 链式取值，空则记 ERROR 返回 False。
+- **BPF 失败静默抓全部**：`attach_filter` 失败原 `except Exception` 吞掉继续抓全部流量，调用方要过滤却抓到非预期流量。改抛 RuntimeError 让 `tcpdump_start` 返回 False。
+- **`stop()` 半初始化崩溃**：`_open` 中途失败（bind/网卡不存在）时 `_sock` 仍 None，失败路径调 `stop()` 抛 `AttributeError` 盖掉真实启动错误。加 `if self._sock is not None` 防御。
+- **文档/注释**：`init_capture` docstring 与 `setup_environment` 读取 `_sniff_command` 一致化；恢复 `Tcpdump_scapy` 弃用头块（`handlers.py:151` 交叉引用重新有指向）。
+
+### 历史 review 结论
+
+- 无历史回归：v1.3.1 的 capture 安全修复（停止幂等、flush 保证、`self.e=False` 竞态、shell 注入、`_sniff_command` RuntimeError）被新设计结构性消除——无子进程/无 PID/无信号/无 shell。
+
+---
+
 ## [1.4.0] — 2026-07-09
 
 **兼容 DPI 版本：v1.0.7.0**
