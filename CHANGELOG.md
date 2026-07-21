@@ -2,6 +2,19 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.5.1] — 2026-07-21
+
+**兼容 DPI 版本：v1.0.7.0**
+
+### 紧急修复：datatype 131 首次拨测 UnboundLocalError（handlers.py）
+
+- **现象**：拨测（datatype 131）首次调用即崩，日志报 `local variable 'boce' referenced before assignment`。
+- **根因**：`do()` 的 `global` 声明（`global ss, cache_sendpkts`）漏了 `boce`。而 131 路径对 `boce` 既有读（`boce.boce(**data) if boce else None`）又有赋值（`boce = BoceChecker()`）。Python 规则：函数体内有赋值的变量被视为 local，于是 244 行的读 `boce` 被判定为 local——首次调用时还没赋值 → `UnboundLocalError`，模块级 `boce = None` 被局部声明遮蔽读不到。
+- **历史**：`ef72626`（2026-06-24）写 131 逻辑时 `global` 就没含 `boce`，潜伏至今；`4cc423c`（2026-07-08）清理 Tcpdump_scapy 改 `global` 时也未补回。与 1.5.0 抓包重写无关。
+- **修复**：`global ss, cache_sendpkts, boce` 补回 `boce`。已验证首次调用正常初始化且不再崩。
+
+---
+
 ## [1.5.0] — 2026-07-21
 
 **兼容 DPI 版本：v1.0.7.0**

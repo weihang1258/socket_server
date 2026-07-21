@@ -27,7 +27,7 @@ cache_sendpkts = None
 
 
 def do(datatype, data: bytes, **kwargs):
-    global ss, cache_sendpkts  # tcpdump_scapy 已弃用，移出 global 声明
+    global ss, cache_sendpkts, boce
 
     # scapy 发包
     if datatype == 0:
