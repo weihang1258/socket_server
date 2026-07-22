@@ -24,8 +24,13 @@ ETH_P_ALL = 0x0003
 SOL_PACKET = 263
 PACKET_ADD_MEMBERSHIP = 1
 PACKET_MR_PROMISC = 1
+PACKET_AUXDATA = 8             # setsockopt(SOL_PACKET, PACKET_AUXDATA,1) → 内核在 cmsg 附带 tpacket_auxdata（含被剥离的 VLAN）
 SO_TIMESTAMPNS = 35          # 内核纳秒时间戳
 SO_ATTACH_FILTER = 26        # 经典 BPF 过滤器
+# tpacket_auxdata.tp_status 位：内核在收包前已把 802.1Q 标签剥到 skb 元数据，auxdata 携带还原信息
+TP_STATUS_VLAN_VALID = 0x10       # bit4: tp_vlan_tci 有效
+TP_STATUS_VLAN_TPID_VALID = 0x40  # bit6: tp_vlan_tpid 有效
+ETH_P_8021Q = 0x8100             # auxdata 无有效 tpid 时的默认 TPID（对齐 libpcap VLAN_TPID 宏）
 DLT_EN10MB = 1               # Ethernet 链路类型
 PCAP_MAGIC_US_LE = 0xA1B2C3D4   # 微秒，小端（标准 libpcap TCPDUMP_MAGIC）
 PCAP_MAGIC_US_BE = 0xD4C3B2A1   # 微秒，大端（字节序互换）
@@ -68,6 +73,15 @@ class AFPacketCapture:
             s.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS, 1)
         except OSError as e:
             logger.warning(f"网卡 {self.eth} 不支持 SO_TIMESTAMPNS: {e}，回退到用户态时间戳（保序精度降低）")
+        # 请求内核在 ancdata 附带 tpacket_auxdata（含被剥离的 VLAN TCI/TPID）。
+        # AF_PACKET 收包时内核已把 802.1Q 标签从帧里剥到 skb 元数据（net/core/dev.c 的
+        # skb_vlan_untag / af_packet.c 的 tp_vlan_tci），不开 AUXDATA 就拿不到，落盘 pcap
+        # 丢 VLAN 层。开了之后 _restore_vlan 据 cmsg 还原在线帧（对齐 libpcap pcap-linux.c:2732）。
+        # 失败（老内核 ENOPROTOOPT）只 warn，退化为现状（不还原 VLAN）。
+        try:
+            s.setsockopt(SOL_PACKET, PACKET_AUXDATA, 1)
+        except OSError as e:
+            logger.warning(f"网卡 {self.eth} 不支持 PACKET_AUXDATA: {e}，VLAN 标签将无法还原")
         # 增大接收缓冲，降低突发丢包。Linux 会静默把 val 截断到 net.core.rmem_max，
         # 不报错。setsockopt 之后必须 getsockopt 验证实际生效值——若被截断，记 warning
         # 提示 sysctl，否则 boce 突发下 AF_PACKET socket 缓冲溢出、recv 线程来不及
@@ -126,13 +140,22 @@ class AFPacketCapture:
                     data, ancdata, _flags, _addr = self._sock.recvmsg(65535, 1024)
                 except socket.timeout:
                     continue
-                except OSError:
-                    # socket 已关闭，正常退出
+                except OSError as e:
+                    # 区分"socket 被 stop 关闭的正常退出"与"网卡 down / 网卡消失"。
+                    # errno 100=ENETDOWN(网卡down) / 19=ENODEV(网卡消失)：给出明确原因，
+                    # 否则会被吞成含糊的"线程未存活"，掩盖真实启动失败原因（见 10.12.131.35 故障）。
+                    if e.errno in (100, 19):
+                        logger.error(
+                            f"抓包网卡 {self.eth} 不可用（{e.strerror}），请检查网卡是否 up/插线：{self.path}"
+                        )
+                        self._exc = e
+                    # socket 已关闭或网卡不可用，退出循环
                     break
                 if not data:
                     break
                 ts_ns = self._extract_ts_ns(ancdata)
-                self._write_packet(data, ts_ns)
+                frame = self._restore_vlan(data, ancdata)
+                self._write_packet(frame, ts_ns)
         except Exception as e:
             self._exc = e
             logger.exception(f"抓包线程异常 {self.eth} -> {self.path}")
@@ -145,6 +168,47 @@ class AFPacketCapture:
                 tv_sec, tv_nsec = struct.unpack("@ll", cmsg_data)
                 return tv_sec * 1_000_000_000 + tv_nsec
         return time.time_ns()
+
+    def _restore_vlan(self, data, ancdata):
+        """若内核 auxdata 标记帧带 VLAN，把被剥离的 802.1Q 标签插回 offset 12，还原在线帧。
+
+        内核在 __netif_receive_skb_core（入向 skb_vlan_untag）/ dev_queue_xmit_nit
+        （出向 clone 早于 validate_xmit_vlan）路径把 802.1Q 标签从帧剥到 skb 元数据
+        （vlan_tci/vlan_proto），AF_PACKET tap 看到的是无 VLAN 的帧。开了 PACKET_AUXDATA
+        后内核把 tpacket_auxdata 放进 cmsg，据此还原。严格对齐 libpcap pcap-linux.c:4302-4327。
+        非 VLAN 帧原样返回，一字节不加。
+        """
+        # 找 PACKET_AUXDATA cmsg
+        aux = None
+        for cmsg_level, cmsg_type, cmsg_data in ancdata:
+            if cmsg_level == SOL_PACKET and cmsg_type == PACKET_AUXDATA:
+                aux = cmsg_data
+                break
+        if aux is None:
+            return data  # 内核没给 auxdata（未开或老内核），原样返回
+        # tpacket_auxdata: tp_status(u32) tp_len(u32) tp_snaplen(u32) tp_mac(u16)
+        # tp_net(u16) tp_vlan_tci(u16) tp_vlan_tpid(u16)，本机字节序无 padding，共 20 字节。
+        # cmsg 长度不足（ABI 不一致的老内核）则跳过还原，不崩。
+        need = struct.calcsize("=IIIHHHH")
+        if len(aux) < need:
+            return data
+        tp_status, _tp_len, _tp_snaplen, _tp_mac, _tp_net, tp_vlan_tci, tp_vlan_tpid = \
+            struct.unpack("=IIIHHHH", aux[:need])
+        # VLAN_VALID 宏（pcap-linux.c:315）：tp_vlan_tci!=0 或 TP_STATUS_VLAN_VALID 置位才算 VLAN 帧
+        if not (tp_vlan_tci != 0 or (tp_status & TP_STATUS_VLAN_VALID)):
+            return data
+        # VLAN_TPID 宏（pcap-linux.c:329）：tpid 非零或 TPID_VALID 置位则用之，否则默认 0x8100
+        if tp_vlan_tpid != 0 or (tp_status & TP_STATUS_VLAN_TPID_VALID):
+            tpid = tp_vlan_tpid
+        else:
+            tpid = ETH_P_8021Q
+        # DLT_EN10MB 的 vlan_offset = 2*ETH_ALEN = 12。帧不足 12B（连 dst+src MAC 都不全）无法插入。
+        if len(data) < 12:
+            return data
+        # offset 12（src MAC 之后、ethertype 之前）插 4 字节 VLAN 标签：TPID(2) + TCI(2)，网络序。
+        # 原 offset12-13 的 ethertype 后移到 16-17 成为内层 ethertype = 标准 802.1Q 帧结构。
+        # 等价 libpcap 的 memmove(bp, bp+4, 12) + 在 offset12 写 tag。
+        return data[:12] + struct.pack("!HH", tpid, tp_vlan_tci) + data[12:]
 
     def _write_packet(self, data, ts_ns):
         ts_sec = ts_ns // 1_000_000_000

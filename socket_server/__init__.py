@@ -47,12 +47,39 @@ def init_capture():
     logger.info("使用进程内 AF_PACKET 抓包（不依赖外部二进制）")
 
 
+def _ensure_sock_buf_limits():
+    """serve 启动时确保 net.core.rmem_max/wmem_max >= 8MB。
+
+    boce 突发下 AF_PACKET socket 缓冲若被 rmem_max 静默截断（默认 212992 仅 416KB）
+    会丢包（v1.5.2 已加 SO_RCVBUF 截断检测告警，但只告警不修）。serve 以 root 运行，
+    写 /proc/sys 即时全局生效；随 systemd 每次启动重设，等价持久，不碰 /etc。
+    <8MB 才写，>=8MB 不动；失败只 warn 不阻断 serve。
+    """
+    TARGET = 8 * 1024 * 1024
+    for name in ("net/core/rmem_max", "net/core/wmem_max"):
+        path = "/proc/sys/" + name
+        try:
+            with open(path) as f:
+                cur = int(f.read().strip())
+            if cur >= TARGET:
+                continue
+            with open(path, "w") as f:
+                f.write(str(TARGET))
+            logger.info(f"已将 {name.replace('/', '.')} 从 {cur} 调到 {TARGET}（降低抓包/发送缓冲丢包）")
+        except (OSError, ValueError) as e:
+            logger.warning(
+                f"调整 {name.replace('/', '.')} 失败（不影响服务，"
+                f"建议手动 sysctl -w {name.replace('/', '.')}={TARGET}）: {e}"
+            )
+
+
 def setup_environment():
     """serve 启动时的环境初始化（防火墙、java、chromium 等）"""
     setup_logging()
     logger.info(f"version:{VERSION}")
     init_capture()
     logger.info(f"使用抓包工具：{_sniff_command}")
+    _ensure_sock_buf_limits()
 
     # java 路径
     cmd = "dirname `find /usr/local/ -type f -name java|head -n 1`"

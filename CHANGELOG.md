@@ -2,6 +2,38 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.5.3] — 2026-07-22
+
+**兼容 DPI 版本：v1.0.7.0**
+
+### 还原内核剥离的 VLAN 标签 + 启动期自动调大缓冲上限 + down 网卡诊断（capture.py / __init__.py）
+
+#### 现象
+v1.5.2 修好抓包丢包后，发现抓出的 pcap **没有 VLAN 层**——线上明明带 802.1Q 的帧，落盘后 VLAN 头消失。抓包要求"原始报文、不丢数据信息"，VLAN 层丢失即数据丢失。
+
+#### 根因（读内核 + libpcap 源码确认，非猜测）
+- **内核在把帧交给 AF_PACKET tap 之前就剥掉了 802.1Q 标签**，剥进 skb 元数据 `vlan_tci`/`vlan_proto`：
+  - 入向 `__netif_receive_skb_core`（`net/core/dev.c:6032`）`skb_vlan_untag` 先剥，**之后**才 `ptype_all` tap；
+  - 出向 `dev_queue_xmit_nit`（`:3884`）先 clone 给 tap，**之后** `validate_xmit_vlan`（`:3923`）才把 VLAN 推进帧。
+- **内核把剥掉的 VLAN 放进了 `PACKET_AUXDATA` 辅助消息**（`net/packet/af_packet.c:3527-3566` 填 `tpacket_auxdata` + `put_cmsg`），但**前提是 socket 设了 `PACKET_AUXDATA` 选项**。旧代码没设 → cmsg 无 VLAN 信息 → 原样写"被剥过的帧" → pcap 丢 VLAN。
+- tcpdump/wireshark 的做法：`setsockopt(PACKET_AUXDATA,1)`（`pcap-linux.c:2732`），收包时从 cmsg 取 `tp_vlan_tci`/`tp_vlan_tpid`，在 offset 12 插回 4 字节 802.1Q 头（`pcap-linux.c:4302-4327`）。本版做完全一样的事。
+
+#### 修复
+- `_open` 设 `PACKET_AUXDATA=8` 选项，让内核在 ancdata 附带 `tpacket_auxdata`。失败（老内核 ENOPROTOOPT）只 warn，退化为不还原（现状）。
+- 新增 `_restore_vlan(data, ancdata)`：从 cmsg 取 `tpacket_auxdata`（`=IIIHHHH` 本机序解包），按 libpcap 的 `VLAN_VALID`/`VLAN_TPID` 宏判断帧是否带 VLAN；带则在 offset 12 插入 4 字节 `TPID(网络序)+TCI(网络序)`，还原在线原始帧；非 VLAN 帧原样返回一字节不加。`_recv_loop` 收包后先 `_restore_vlan` 再落盘。
+- 兼容性：cmsg 缺失/长度不足（ABI 不一致老内核）/帧不足 12B → 一律原样返回，不崩。
+- 下游消费者无需改：`pcap_flow.py:62-70` 与 `replayer.py:184-188` 本就显式检测 `0x8100` 并跳 4 字节取内层 ethertype，修复前它们从没收到 VLAN 帧，现在正常跳过 → 流分类结果不变，只是 VLAN 层重新可见。
+
+### 启动期自动调大 rmem_max/wmem_max（__init__.py）
+- v1.5.2 加了 SO_RCVBUF 被截断的告警，但只告警不修。本版在 `setup_environment` 加 `_ensure_sock_buf_limits()`：serve 启动时读 `net.core.rmem_max`/`wmem_max`，<8MB 则写 `/proc/sys` 调到 8MB，幂等、>=8MB 不动、失败只 warn 不阻断 serve。
+- serve 以 root 跑、随 systemd 每次开机重设 → 等价持久，自包含、不碰 `/etc`。
+
+### down 网卡诊断（capture.py）
+- 10.12.131.35 "启动抓包失败"根因已确认是网卡 down（`enp94s0f0np0` 无 link）：AF_PACKET `bind` 到 down 网卡不报错，但 `recvmsg` 立即抛 `OSError(ENETDOWN)`，被 `_recv_loop` 的 `except OSError: break` 静默吞 → 线程 0.5s 内退出 → 报含糊的"线程未存活"，真实原因没传达。
+- 修复：`except OSError` 分支对 errno 100(ENETDOWN)/19(ENODEV) 打明确 error "网卡不可用，请检查是否 up/插线" 并设 `_exc`，不再含糊。仅加诊断，不改启动判定（down 网卡仍返回 False，正确）。
+
+---
+
 ## [1.5.2] — 2026-07-22
 
 **兼容 DPI 版本：v1.0.7.0**
