@@ -30,36 +30,57 @@ class SocketServerListen:
         af = socket.AF_INET if version == 4 else socket.AF_INET6
         return [(self.host, af)]
 
+    def _handle_conn(self, conn, addr):
+        """单连接接收循环，在独立线程中运行。
+
+        并发 accept 后每个连接独占一个线程 recv，避免一个常驻连接
+        阻塞后续连接（原迭代式 accept 的缺陷：accept 一个后即陷在该连接
+        的 recv 循环里，直到它关闭才能接下一个）。所有连接的数据仍 put
+        进同一个 self.q，下游 cachedata 维持合并流语义不变。
+        """
+        try:
+            with conn:
+                logger.info(f"Connected by {addr}")
+                while self._stop_flag:
+                    try:
+                        data = conn.recv(10240)
+                    except (ConnectionResetError, OSError) as e:
+                        logger.info(f"连接 {addr} 异常断开: {e}")
+                        break
+                    if not data:  # 对端正常关闭
+                        break
+                    self.q.put(data)
+        except Exception as e:
+            logger.error(f"连接 {addr} 处理异常: {e}")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            logger.info(f"连接 {addr} 已断开")
+
     def _start_server(self, host, af):
         with socket.socket(af, socket.SOCK_STREAM) as s:
             if af == socket.AF_INET6:
                 s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((host, self.port))
-            s.listen(5)
+            s.listen(128)
             logger.info(f"Listening on [{host}]:{self.port} (IPv{'6' if af == socket.AF_INET6 else '4'})...")
 
             while self._stop_flag:
-                conn, addr = s.accept()
                 try:
-                    with conn:
-                        logger.info(f"Connected by {addr}")
-                        while self._stop_flag:
-                            data = conn.recv(10240)
-                            if not data:
-                                time.sleep(0.5)
-                                logger.error("无效数据循环2...")
-                                break
-                            self.q.put(data)
-                except Exception as e:
-                    logger.error(e)
-                finally:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-                logger.error("无效数据循环3...")
-                time.sleep(0.5)
+                    conn, addr = s.accept()
+                except OSError as e:
+                    if not self._stop_flag:
+                        break
+                    logger.error(f"accept 异常: {e}")
+                    time.sleep(0.5)
+                    continue
+                # 每连接一线程：accept 循环立即回到 accept 继续收下一个连接，
+                # 不再被单个常驻连接的 recv 阻塞。
+                t = threading.Thread(target=self._handle_conn, args=(conn, addr), daemon=True)
+                t.start()
 
     def start_server(self):
         try:

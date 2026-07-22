@@ -2,6 +2,31 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.5.5] — 2026-07-22
+
+**兼容 DPI 版本：v1.0.7.0**
+
+### 修 socket 监听 30001 被单个常驻连接卡死：并发 accept（socket_listen.py）
+
+#### 现象
+10.12.131.82 上 datatype 171 启动 30001 监听后，IPv4 路径新连接全部超时、抓不到数据；IPv6 路径偶发能通。`ss` 显示 listen backlog（Recv-Q=6）已塞满完成三次握手但从未被 `accept()` 取走的连接（无 owner），其中一个 Recv-Q 高达 127KB——客户端数据早到了，服务端没读。
+
+#### 根因
+`_start_server` 是**迭代式服务器**：`accept()` 一个连接后，整个监听进程就陷在该连接的 `recv` 循环里，**直到该连接关闭**才能 accept 下一个。只要有一个客户端常驻连接（现场是 DPI 上报流 10.12.131.33）持续推数据，后续连接就只能排进 `listen(5)` 的 backlog，满后 SYN 被内核丢弃。IPv4/IPv6 是两个独立监听进程，哪个被占哪个瘫痪，所以表现为半瘫。
+
+复现：本机向 `127.0.0.1:30001` 发测试包 → `timeout('timed out')`；向 `[::1]:30001` 发 → 秒通落盘。
+
+#### 修复
+- `_start_server` 改为**并发 accept**：`accept()` 出连接后立即交给 daemon 线程 `_handle_conn` 去 `recv`，主循环立刻回到 `accept()` 继续收下一个。
+- 数据仍 put 进同一个 `multiprocessing.Queue`，下游 `cachedata` 维持**合并流**语义不变（datatype 174/173 返回内容结构不变）。
+- `listen(5)` → `listen(128)`，给突发连接留缓冲。
+- `_handle_conn`：`recv` 异常（ConnectionResetError/OSError）和对端正常关闭（`not data`）分支明确区分，去掉原"无效数据循环2/3"的含糊日志。
+
+#### 验证
+本地端到端：常驻连接占住期间，并发发起后续 IPv4/IPv6 连接均秒通落盘；单连接内多次 `sendall` 的分片正确按序拼回。
+
+---
+
 ## [1.5.4] — 2026-07-22
 
 **兼容 DPI 版本：v1.0.7.0**
