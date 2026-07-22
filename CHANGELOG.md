@@ -2,6 +2,38 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.5.2] — 2026-07-22
+
+**兼容 DPI 版本：v1.0.7.0**
+
+### 紧急修复：抓包丢失 + "内核丢弃 0 包"假信号（capture.py）
+
+#### 现象
+
+- 同一次 boce（1000 并发连接），拨测机抓包 1043 / 靶站抓包 6991，拨测机丢 ~85% 包（出向 SYN 172/1000、入向 SYN-ACK 207/1000）。
+- 但日志始终报"内核丢弃 0 包"，让人误以为不是丢包问题。
+
+#### 根因（三层叠加）
+
+1. **`stop()` 顺序 bug → 统计永远为 0**（`AFPacketCapture.stop` / `_read_stats`）
+   原顺序：`shutdown → close socket → join thread → 线程 finally 调 _read_stats`。线程 finally 在已关闭 fd 上 `getsockopt(PACKET_STATISTICS)` → `OSError(EBADF)` → 被 `except (OSError, struct.error): pass` 静默吞掉 → `_dropped` 永远保持初始值 0。**所有"内核丢弃 0 包"日志都是假信号**。
+
+2. **`SO_RCVBUF` 被 `net.core.rmem_max` 静默截断**（`_open`）
+   内核对 `SO_RCVBUF` 的规则：请求值超过 `rmem_max` 时静默截断，不报错。原代码 `try: setsockopt; except: pass` 完全没察觉。拨测机实测 `rmem_max=212992`，请求 4MB 实际生效仅 416KB（≈ 600 个 ~700B 包）。boce 前 0.2s 突发 ~3000 pps，瞬间填满缓冲 → 内核丢包。
+
+3. **Python 单线程 recv + GIL 竞争**（`_recv_loop`）
+   单线程 `recvmsg → struct.unpack → struct.pack → f.write` 全串行。boce 同时跑 10 个 `ThreadPoolExecutor` worker 线程（`boce.py:53`），全部跟 recv 线程抢 GIL，recv 线程跟不上峰值 pps。靶站没事是因为靶站 socket_server 进程没有 10 个并发 outbound worker 线程，GIL 不被抢。
+
+#### 修复
+
+- **第 1 层（本次发版）**：
+  - `stop()` 改成 `join → _read_stats → close`，统计能在 socket 还活着时读到真实 `tpacket_stats.tp_drops`。
+  - `_recv_loop` 移除 `finally: _read_stats()`，避免在已关闭 fd 上调用。
+  - `_open` 中 setsockopt `SO_RCVBUF=4MB` 后立即 `getsockopt` 验证实际值；若小于请求值 ×2（Linux 把 val 翻倍用于协议开销），记 warning 提示 `sysctl -w net.core.rmem_max=8388608`。
+- **第 3 层（v1.6.0 再做）**：改用 `PACKET_RX_RING` mmap 接收，绕过 recvmsg + GIL 竞争，从根本上解决 Python 单线程跟不上突发 pps 的问题。
+
+---
+
 ## [1.5.1] — 2026-07-21
 
 **兼容 DPI 版本：v1.0.7.0**

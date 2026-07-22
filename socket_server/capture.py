@@ -68,11 +68,30 @@ class AFPacketCapture:
             s.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS, 1)
         except OSError as e:
             logger.warning(f"网卡 {self.eth} 不支持 SO_TIMESTAMPNS: {e}，回退到用户态时间戳（保序精度降低）")
-        # 增大接收缓冲，降低突发丢包
+        # 增大接收缓冲，降低突发丢包。Linux 会静默把 val 截断到 net.core.rmem_max，
+        # 不报错。setsockopt 之后必须 getsockopt 验证实际生效值——若被截断，记 warning
+        # 提示 sysctl，否则 boce 突发下 AF_PACKET socket 缓冲溢出、recv 线程来不及
+        # drain 的包会被内核丢，且 stop 路径下 tp_drops 才能被准确读到。
+        REQUEST_RCVBUF = 4 * 1024 * 1024
         try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-        except OSError:
-            pass
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, REQUEST_RCVBUF)
+            actual = s.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+            # Linux 把 val 翻倍用于协议开销，所以 getsockopt 返回值 >= 请求值*2。
+            # 若实际 < 请求值*2，说明被 rmem_max 截断。
+            if actual < REQUEST_RCVBUF * 2:
+                try:
+                    with open("/proc/sys/net/core/rmem_max") as f:
+                        rmem_max = int(f.read().strip())
+                except OSError:
+                    rmem_max = None
+                logger.warning(
+                    f"网卡 {self.eth} SO_RCVBUF 被截断：请求 {REQUEST_RCVBUF//1024}KB，"
+                    f"实际 {actual//1024}KB"
+                    + (f"（net.core.rmem_max={rmem_max}）。建议 sysctl -w net.core.rmem_max=8388608"
+                       if rmem_max else "。建议调大 net.core.rmem_max")
+                )
+        except OSError as e:
+            logger.warning(f"网卡 {self.eth} 设置 SO_RCVBUF 失败: {e}")
         # promisc（兼容本机流量 + SPAN 镜像口）；失败不阻断
         try:
             ifindex = socket.if_nametoindex(self.eth)
@@ -99,6 +118,8 @@ class AFPacketCapture:
         self._f.flush()
 
     def _recv_loop(self):
+        # 纯收包循环：内核统计由 stop() 在 join 之后、close 之前调 _read_stats 读取
+        # （recv 线程在此不去碰 self._sock 上的 getsockopt，避开 close 顺序竞争）
         try:
             while not self._stopped.is_set():
                 try:
@@ -115,8 +136,6 @@ class AFPacketCapture:
         except Exception as e:
             self._exc = e
             logger.exception(f"抓包线程异常 {self.eth} -> {self.path}")
-        finally:
-            self._read_stats()
 
     def _extract_ts_ns(self, ancdata):
         """从 ancdata 取 SO_TIMESTAMPNS 的 timespec(秒, 纳秒)，回退到 time.time_ns()。"""
@@ -154,24 +173,24 @@ class AFPacketCapture:
 
     def stop(self, timeout=10):
         self._stopped.set()
-        # _open 可能中途失败（bind/bad-BPF），此时 _sock/_thread 仍为 None，需防御
-        if self._sock is not None:
-            try:
-                self._sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                self._sock.close()
-            except OSError:
-                pass
+        # 顺序关键：先让线程退出循环（不能再 recv），再读内核统计（必须在 close 前），
+        # 最后才 close socket。原顺序 close→join 会让线程 finally 在已关闭 fd 上
+        # getsockopt → OSError 被 except 吞 → _dropped 永远 0，"内核丢弃 0 包"假信号。
         if self._thread is not None:
             self._thread.join(timeout=timeout)
         alive = self._thread is not None and self._thread.is_alive()
         if alive:
-            # 线程未在超时内退出：不关闭文件，避免与仍在 _write_packet 的写入竞态
-            # （socket 已关闭，recv 会在下一次循环退出，但本轮写入不应被 close 打断）
+            # 线程未在超时内退出：不读 stats、不关文件，避免与仍在 _write_packet 的写入竞态
+            # （socket 仍开着让 recv 线程自然退出，本轮写入不应被 close 打断）
             logger.error(f"停止抓包线程超时(>{timeout}s)：{self.eth} -> {self.path}")
             return False
+        # 线程已退出、socket 还活着：在 close 前抓最后一次 tpacket_stats（真实值）
+        if self._sock is not None:
+            self._read_stats()
+            try:
+                self._sock.close()
+            except OSError:
+                pass
         # 线程已退出，安全 flush/close（替代旧的轮询文件大小稳定）
         if self._f is not None:
             try:
