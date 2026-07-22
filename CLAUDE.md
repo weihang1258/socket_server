@@ -24,14 +24,65 @@ docker run --rm -v $(pwd):/work -w /work socket_server-builder:centos7-py38 \
   pyinstaller packaging/socket_server.spec --clean --noconfirm'
 ```
 
-### Release
+### Release（标准发版流程，逐步执行）
 
+> **经验**：1.5.0/1.5.1 发版踩过坑——`gh release create` 带 `dist/socket_server`（16M 二进制）上传的组合，Claude Code 的 Bash 安全分类器会间歇性拒绝（Stage 2 classifier error），重试也不放行，浪费大量时间。**不要反复重试同一条被挡的命令**。处理见下方"分类器拒绝时"。
+
+**1. 改版本号 + CHANGELOG + release_notes**
+- `socket_server/version.py` 改 `VERSION`。
+- `CHANGELOG.md` 顶部加新版本段（日期、兼容 DPI 版本、变更条目）。
+- 跑 `python3 packaging/generate_release_notes.py` 重新生成 `socket_server/release_notes.py`（`.gitignore` 不入库，打包内嵌）。
+
+**2. 本地验证（提交前必做）**
+- `python3 -m py_compile` 改动的 .py 文件。
+- 若改动是 bug 修复，构造最小复现确认旧 bug 消失、新行为正确（别只看编译通过）。
+
+**3. 提交 + tag + push**
 ```bash
-# Bump version in socket_server/version.py + update CHANGELOG.md
-git tag -a v<version> -m "message"
+git add <改动的文件>
+git commit -m "<type>: <version> <说明>"
+git tag -a v<version> -m "<version>: <一句话>"
+git push origin main
 git push origin v<version>
-# Create GitHub Release via API or web, upload dist/socket_server + sha256
 ```
+
+**4. 构建（CentOS 7 builder）**
+```bash
+rm -rf dist build
+docker run --rm -v $(pwd):/work -w /work socket_server-builder:centos7-py38 \
+  sh -c 'pip3 install --proxy http://10.12.186.204:7897 \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    scapy requests psutil wheel pyinstaller packaging pyppeteer && \
+  pyinstaller packaging/socket_server.spec --clean --noconfirm'
+```
+- 看 exit code + `ls -lh dist/socket_server`（应 16M，ELF x86-64）。
+- `./dist/socket_server current` 确认版本号。
+- 改动涉及运行时行为的，起 `serve` 跑一次对应 datatype 端到端验证。
+
+**5. sha256**
+```bash
+sha256sum dist/socket_server | tee dist/socket_server.sha256
+```
+
+**6. 生成 release notes 文件 + 创建 Release**
+```bash
+python3 -c "from socket_server.release_notes import RELEASE_NOTES; print(RELEASE_NOTES.strip())" > /tmp/release_notes_<version>.md
+HTTPS_PROXY=http://10.12.186.204:7897 gh release create v<version> \
+  -R weihang1258/socket_server --title "v<version>" \
+  --notes-file /tmp/release_notes_<version>.md \
+  dist/socket_server dist/socket_server.sha256
+```
+- `gh` 走代理（直连 GitHub API 偶发 EOF）。
+- 验证：`HTTPS_PROXY=http://10.12.186.204:7897 gh release view v<version> -R weihang1258/socket_server --json tagName,url,assets`，确认 assets 含 `socket_server` + `socket_server.sha256`。
+
+**分类器拒绝 `gh release create` 时（已多次发生）**
+
+- 判定特征：Claude Code 返回 `Stage 2 classifier error` 或 `claude-sonnet-5 is temporarily unavailable, so auto mode cannot determine the safety of Bash`，**连续重试 2-3 次仍不放行**。
+- 不要继续重试。直接让用户在**真实 bash 终端**（不是 Claude Code 输入框）手动跑第 6 步的命令——终端的 `!` 是历史展开会报 `event not found`，所以**去掉命令开头的 `!`**，直接 `HTTPS_PROXY=... gh release create ...` 即可。tag/二进制/sha256/notes 都已就绪，用户跑完这一条即发版完成。
+- 仓库**没有 CI 自动发版**：`.github/workflows/` 不存在，所有 release 的 `created_via` 都是 `null`，全部手动 `gh release create` 发。不要假设有自动路径可抄。
+
+**发版后清理**
+- 跑完 `serve` 验证的，记得 `pkill -f "dist/socket_server serve"` 关掉残留进程。
 
 ## Architecture
 
