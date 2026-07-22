@@ -64,7 +64,7 @@ def _ensure_sock_buf_limits():
             if cur >= TARGET:
                 continue
             with open(path, "w") as f:
-                f.write(str(TARGET))
+                f.write(f"{TARGET}\n")
             logger.info(f"已将 {name.replace('/', '.')} 从 {cur} 调到 {TARGET}（降低抓包/发送缓冲丢包）")
         except (OSError, ValueError) as e:
             logger.warning(

@@ -2,6 +2,7 @@ import os
 import time
 import struct
 import socket
+import errno
 import logging
 import threading
 
@@ -66,8 +67,12 @@ class AFPacketCapture:
         self._dropped = 0
 
     def _open(self):
-        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
-        s.bind((self.eth, 0))
+        # proto=0 创建：packet_create（af_packet.c:3393）仅在 proto!=0 时 __register_prot_hook
+        # 注册收包。proto=0 不注册，socket 此时不收包。所有 setsockopt + BPF 先就位，
+        # 最后 bind(ETH_P_ALL) 才注册收包 -> 第一个包起即被 BPF 过滤，杜绝"bind 后 BPF
+        # 附上前"的未过滤窗口（10.12.131.32 实测：bind 到 BPF 附加间隔 ~412ms，期间
+        # ARP/UDP/非目标 flag 包漏进缓冲污染抓包结果）。
+        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, 0)
         # 纳秒时间戳：内核为每个包打 SO_TIMESTAMPNS，ancdata 取回
         try:
             s.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS, 1)
@@ -122,6 +127,10 @@ class AFPacketCapture:
                 logger.info(f"网卡 {self.eth} 已附加 BPF 过滤: {self.extended}")
             except Exception as e:
                 raise RuntimeError(f"BPF 过滤编译失败({self.extended}): {e}") from e
+        # 最后 bind：此时才注册 prot_hook 开始收包，BPF 已附上，无未过滤窗口。
+        # proto=0 创建后 po->num=0，bind 必须显式给 ETH_P_ALL（bind(0) 会 fallback 到
+        # po->num=0 不注册收包）。Python AF_PACKET bind 自动 htons 主机序 proto。
+        s.bind((self.eth, ETH_P_ALL))
         # 阻塞 recv 加超时，让 stop 的 Event 能及时被检查到
         s.settimeout(1.0)
         self._sock = s
@@ -142,9 +151,9 @@ class AFPacketCapture:
                     continue
                 except OSError as e:
                     # 区分"socket 被 stop 关闭的正常退出"与"网卡 down / 网卡消失"。
-                    # errno 100=ENETDOWN(网卡down) / 19=ENODEV(网卡消失)：给出明确原因，
-                    # 否则会被吞成含糊的"线程未存活"，掩盖真实启动失败原因（见 10.12.131.35 故障）。
-                    if e.errno in (100, 19):
+                    # ENETDOWN(网卡down) / ENODEV(网卡消失)：给出明确原因，否则会被吞成
+                    # 含糊的"线程未存活"，掩盖真实启动失败原因（见 10.12.131.35 故障）。
+                    if e.errno in (errno.ENETDOWN, errno.ENODEV):
                         logger.error(
                             f"抓包网卡 {self.eth} 不可用（{e.strerror}），请检查网卡是否 up/插线：{self.path}"
                         )
@@ -311,12 +320,14 @@ def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue
         return False
     # 起后短暂等待，确认线程存活且无异常（对照旧实现起后检查语义）
     time.sleep(0.5)
-    if cap._thread is None or not cap._thread.is_alive():
-        logger.error(f"抓包线程未存活 {eth} -> {path}")
+    # 先查 _exc：_recv_loop 对网卡 down/消失已记过明确原因，这里补一句启动失败即可，
+    # 避免再打含糊的"线程未存活"掩盖真实原因（见 10.12.131.35 故障）。
+    if cap._exc is not None:
+        logger.error(f"抓包启动失败 {eth} -> {path}: {cap._exc}")
         cap.stop()
         return False
-    if cap._exc is not None:
-        logger.error(f"抓包线程启动即异常 {eth} -> {path}: {cap._exc}")
+    if cap._thread is None or not cap._thread.is_alive():
+        logger.error(f"抓包线程未存活 {eth} -> {path}")
         cap.stop()
         return False
     with _captures_lock:

@@ -9,3 +9,4 @@ dist/
 *.egg-info/
 packaging/Python-*.tgz
 socket_server/release_notes.py
+.mcp.json

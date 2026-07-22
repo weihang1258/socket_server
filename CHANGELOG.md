@@ -2,6 +2,37 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.5.4] — 2026-07-22
+
+**兼容 DPI 版本：v1.0.7.0**
+
+### 修 BPF 过滤时机窗口：抓到非过滤条件包（capture.py）
+
+#### 现象
+10.12.131.32 抓 `tcp[13] == 0x1c`，pcap 里混入 25 个非 0x1c 包（17 UDP + 4 ACK + 2 FIN + 2 ARP）。BPF 附上后 2000 包全是 0x1c、零非 0x1c；25 个漏网包时间戳**全部**在 BPF 附上之前。
+
+注：v1.5.3 已发版但漏了此修复（1.5.3 的 capture.py 仍是旧 `socket.htons(ETH_P_ALL)`），本版补上。
+
+#### 根因（读内核 + pcap 实测确认）
+- `_open()` 原顺序：`socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL))` + `bind()` -> setsockopts -> `attach_filter`。
+- 内核 `packet_create`（`af_packet.c:3393`）`if (proto)` 才 `__register_prot_hook` 收包--**socket 一创建就开始收**（bind 前从所有网卡，bind 后从指定网卡）。BPF 在 bind 之后才附，必有"bind 后 BPF 前"窗口。
+- 实测：`from scapy.arch.linux import attach_filter` 首次导入 scapy 耗 ~412ms，期间 socket 无过滤收包进缓冲，recv 线程原样落盘。
+- 现场对照：`proto=ETH_P_ALL` 创建未 bind 即收到包（len=74）；`proto=0` 创建未 bind 收不到包（timeout）。
+
+#### 修复
+- `_open()` 改为 **proto=0 创建（`packet_create` 不注册 prot_hook，socket 不收包）-> setsockopt + BPF attach -> 最后 `bind(ETH_P_ALL)` 才注册收包**。BPF 在收包前就位，零未过滤窗口；scapy 那 412ms 导入发生在 socket 不收包期间，不再泄漏。
+- proto=0 创建后 `po->num=0`，bind 必须显式给 `ETH_P_ALL`（`bind(0)` 会 fallback 到 `po->num=0` 不注册收包）。Python AF_PACKET bind 自动 htons 主机序 proto（已用 getsockname 验证）。
+
+### review 修法（capture.py / __init__.py）
+- `_recv_loop`：down 网卡 errno 魔法数字 `100/19` -> `errno.ENETDOWN/ENODEV`（自解释）。
+- `tcpdump_start`：down 网卡时 `_exc` 检查提到 `is_alive` 前，避免含糊的"线程未存活"盖掉 `_recv_loop` 已打的"网卡不可用"。
+- `_ensure_sock_buf_limits`：sysctl 写入加 `\n`（/proc/sys 数值写惯例）。
+
+### 其他
+- `.gitignore` 加 `.mcp.json`（本地 MCP 配置，不入库）。
+
+---
+
 ## [1.5.3] — 2026-07-22
 
 **兼容 DPI 版本：v1.0.7.0**
