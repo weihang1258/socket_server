@@ -703,7 +703,16 @@ class PcapReplayer:
             raise RuntimeError(f"pcap不存在：{file_path}")
 
         with open(file_path, 'rb') as f:
-            f.read(24)  # 跳过pcap文件头
+            global_header = f.read(24)  # pcap 全局头
+            if len(global_header) < 24:
+                raise RuntimeError(f"pcap 全局头不完整：{file_path}")
+            # 据 magic 判定时间戳分辨率：
+            #   纳秒 magic(0xA1B23C4D / 0x4D3CB2A1) 第二字段是纳秒，除以 1e9
+            #   微秒 magic(0xA1B2C3D4 / 0xD4C3B2A1) 第二字段是微秒，除以 1e6
+            # capture 新版默认写纳秒 magic；老文件/其他抓包工具多写微秒 magic。
+            # 不区分单位会让纳秒文件 timestamp 算错（最多偏 ~1000s），回放节奏全乱。
+            _magic = struct.unpack("=I", global_header[:4])[0]
+            ts_divisor = 1_000_000_000 if _magic in (0xA1B23C4D, 0x4D3CB2A1) else 1_000_000
             last_send_time = time.monotonic()
             bits_per_second = self.mbps * 1_000_000
 
@@ -711,9 +720,9 @@ class PcapReplayer:
                 pkt_hdr = f.read(16)
                 if not pkt_hdr:
                     break
-                ts_sec, ts_usec, incl_len, orig_len = struct.unpack('=IIII', pkt_hdr)
+                ts_sec, ts_frac, incl_len, orig_len = struct.unpack('=IIII', pkt_hdr)
                 pkt_data = f.read(incl_len)
-                timestamp = ts_sec + ts_usec / 1_000_000
+                timestamp = ts_sec + ts_frac / ts_divisor
 
                 try:
                     eth = self.parse_ethernet(pkt_data)
@@ -807,8 +816,9 @@ class PcapReplayer:
         return stats
 
     def _write_pcap_global_header(self, file_handle):
-        # Standard pcap global header
-        # magic_number (0xA1B2C3D4 for microsecond, 0xD4C3B2A1 for nanosecond)
+        # Standard pcap global header（replayer 自己输出的回放 pcap，用微秒 magic）
+        # magic_number 0xA1B2C3D4 = 微秒小端；0xD4C3B2A1 是其大端镜像（不是纳秒）
+        # 纳秒 magic 是 0xA1B23C4D（见 capture.py / replay_file 读取处的 magic 判定）
         # version_major (2)
         # version_minor (4)
         # thiszone (0 for GMT)

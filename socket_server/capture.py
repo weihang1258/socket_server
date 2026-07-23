@@ -33,10 +33,10 @@ TP_STATUS_VLAN_VALID = 0x10       # bit4: tp_vlan_tci 有效
 TP_STATUS_VLAN_TPID_VALID = 0x40  # bit6: tp_vlan_tpid 有效
 ETH_P_8021Q = 0x8100             # auxdata 无有效 tpid 时的默认 TPID（对齐 libpcap VLAN_TPID 宏）
 DLT_EN10MB = 1               # Ethernet 链路类型
-PCAP_MAGIC_US_LE = 0xA1B2C3D4   # 微秒，小端（标准 libpcap TCPDUMP_MAGIC）
+PCAP_MAGIC_US_LE = 0xA1B2C3D4   # 微秒，小端（老文件兼容）
 PCAP_MAGIC_US_BE = 0xD4C3B2A1   # 微秒，大端（字节序互换）
-PCAP_MAGIC_NS_LE = 0xA1B23C4D   # 纳秒，小端
-PCAP_MAGIC_NS_BE = 0x4D3CB2A1   # 纳秒，大端
+PCAP_MAGIC_NS_LE = 0xA1B23C4D   # 纳秒，小端（新版默认，标准 libpcap PCAP_NSEC_MAGIC）
+PCAP_MAGIC_NS_BE = 0x4D3CB2A1   # 纳秒，大端（字节序互换）
 
 
 from .netutils import routeinfo
@@ -48,8 +48,11 @@ class AFPacketCapture:
     设计要点：
     - 不起子进程、不发信号、不查 PID：停止 = 关 socket + join 线程 + 关文件。
       正常路径确定性；join 超时（线程仍存活）则不关文件避免写入竞态，返回 False 可重试。
-    - 不改网卡状态（队列/IRQ/RPS），靠抓完按时间戳稳定重排保序（见 _sort_pcap_by_timestamp）。
-    - 内核纳秒时间戳经 SO_TIMESTAMPNS 取回，落盘截断为微秒（兼容 replayer/pcap_flow 的 =IIII 解析）。
+    - 单队列默认开（tcpdump_start single_queue=True）：缩队列+绑 CPU+关 RPS/RFS，
+      确保收包序=线序（配合纳秒排序根治多队列 RSS 乱序）。注意：该配置会改动网卡状态，
+      且 stop 不还原（持续生效到下次手动调整）；需零侵入时显式传 single_queue=False。
+    - 内核纳秒时间戳经 SO_TIMESTAMPNS 取回，以纳秒落盘（PCAP_NSEC_MAGIC 0xA1B23C4D，
+      不截断微秒），让 burst 内同微秒的包也能被时间戳区分。读取方据 magic 判定除数。
     - promisc 默认开（兼容本机流量与 SPAN 镜像口），失败只 warn 不 abort。
     - 每路抓包一个实例，按 path 注册到 _captures，天然支持同机多 path 并发。
     """
@@ -134,8 +137,11 @@ class AFPacketCapture:
         # 阻塞 recv 加超时，让 stop 的 Event 能及时被检查到
         s.settimeout(1.0)
         self._sock = s
-        # pcap 全局头：微秒 magic，snaplen 65535，Ethernet
-        global_header = struct.pack("<IHHIIII", PCAP_MAGIC_US_LE, 2, 4, 0, 0, 65535, DLT_EN10MB)
+        # pcap 全局头：纳秒 magic，snaplen 65535，Ethernet
+        # 纳秒时间戳让 burst 内同微秒的包可被区分，配合单队列收包序=线序实现保序。
+        # 兼容性：replayer/pcap_flow 读取时据 magic 决定除数（1e9 vs 1e6）。
+        # 旧版微秒 magic 文件仍可读（见 _sort_pcap_by_timestamp 的纳秒回退逻辑）。
+        global_header = struct.pack("<IHHIIII", PCAP_MAGIC_NS_LE, 2, 4, 0, 0, 65535, DLT_EN10MB)
         self._f = open(self.path, "wb")
         self._f.write(global_header)
         self._f.flush()
@@ -221,10 +227,13 @@ class AFPacketCapture:
 
     def _write_packet(self, data, ts_ns):
         ts_sec = ts_ns // 1_000_000_000
-        ts_usec = (ts_ns % 1_000_000_000) // 1000
+        ts_nsec = ts_ns % 1_000_000_000
         caplen = len(data)
-        # 记录头：微秒，小端（匹配 replayer/pcap_flow 的 =IIII）
-        self._f.write(struct.pack("<IIII", ts_sec, ts_usec, caplen, caplen))
+        # 记录头：纳秒，小端（PCAP_NSEC_MAGIC）。纳秒分辨率让 burst 内同微秒的包可被
+        # 时间戳区分；配合单队列（收包序=线序），重排后保序更鲁棒。
+        # 注意：replayer/pcap_flow 读记录头仍用 =IIII（4 个 u32），仅 ts 的单位不同，
+        # 解析方据全局头 magic 判定除数（见 replayer.replay_file 的 _magic 检测）。
+        self._f.write(struct.pack("<IIII", ts_sec, ts_nsec, caplen, caplen))
         self._f.write(data)
         self._pkt_count += 1
 
@@ -275,11 +284,12 @@ class AFPacketCapture:
         return True
 
 
-def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue=False):
+def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue=True):
     """开启抓包（进程内 AF_PACKET）。
 
     签名兼容 datatype 5 / MCP capture_start：eth/path/extended/single_queue。
-    single_queue 默认 False（零网卡侵入）；显式 True 时才调 SingleQueueRxThread。
+    single_queue 默认 True：缩到单队列 + 绑 CPU + 关 RPS/RFS，确保收包序=线序，
+    配合纳秒时间戳排序实现保序（根治多队列 RSS 乱序）。
     """
     if not eth:
         rt = routeinfo().get("0.0.0.0") or {}
@@ -288,9 +298,9 @@ def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue
             logger.error("未指定网卡且系统无默认路由，无法确定抓包网卡")
             return False
 
-    # 可选：单队列 + CPU 绑定（opt-in，默认不动网卡）
+    # 单队列 + CPU 绑定（默认开启：收包序=线序，根治多队列 RSS 乱序）
     if single_queue:
-        logger.info(f"配置网卡 {eth} 为单队列模式（opt-in）")
+        logger.info(f"配置网卡 {eth} 为单队列模式（默认开启）")
         try:
             SingleQueueRxThread(eth=eth, count=1)
         except Exception as e:
@@ -376,8 +386,11 @@ def tcpdump_isrun(path="/home/tmp/tmp.pcap"):
 def _sort_pcap_by_timestamp(path):
     """按 pcap 记录头时间戳稳定重排，原子写覆盖。
 
-    仅处理微秒 magic（LE/BE）；纳秒/pcapng 等格式跳过（记 warn，不破坏文件）。
+    支持微秒 magic（0xA1B2C3D4 / 0xD4C3B2A1）和纳秒 magic（0xA1B23C4D / 0x4D3CB2A1）。
+    微秒：按 (ts_sec, ts_usec, idx) 排序；纳秒：按 (ts_sec, ts_nsec, idx) 排序。
+    纳秒分辨率让 burst 内同微秒的包也能被时间戳区分，配合单队列（收包序=线序）实现保序。
     稳定排序：同时间戳保持原序（Python sorted 默认稳定）。
+    pcapng 等格式跳过（记 warn，不破坏文件）。
     """
     try:
         with open(path, "rb") as f:
@@ -388,11 +401,16 @@ def _sort_pcap_by_timestamp(path):
             magic = struct.unpack("=I", global_header[:4])[0]
             if magic == PCAP_MAGIC_US_LE:
                 endian = "<"
+                divisor = 1_000_000  # 微秒文件
             elif magic == PCAP_MAGIC_US_BE:
                 endian = ">"
-            elif magic in (PCAP_MAGIC_NS_LE, PCAP_MAGIC_NS_BE):
-                logger.warning(f"pcap 为纳秒格式(magic={hex(magic)})，跳过重排：{path}")
-                return True
+                divisor = 1_000_000
+            elif magic == PCAP_MAGIC_NS_LE:
+                endian = "<"
+                divisor = 1_000_000_000  # 纳秒文件
+            elif magic == PCAP_MAGIC_NS_BE:
+                endian = ">"
+                divisor = 1_000_000_000
             else:
                 logger.warning(f"pcap magic 不识别({hex(magic)})，跳过重排：{path}")
                 return True
@@ -403,25 +421,25 @@ def _sort_pcap_by_timestamp(path):
                 hdr = f.read(16)
                 if len(hdr) < 16:
                     break
-                ts_sec, ts_usec, incl_len, _orig_len = struct.unpack(endian + "IIII", hdr)
+                ts_sec, ts_frac, incl_len, _orig_len = struct.unpack(endian + "IIII", hdr)
                 data = f.read(incl_len)
                 if len(data) < incl_len:
                     logger.warning(f"pcap 末尾记录截断，已读取 {len(records)} 包：{path}")
                     break
-                records.append((ts_sec, ts_usec, idx, data))
+                records.append((ts_sec, ts_frac, idx, data))
                 idx += 1
 
-        # 稳定排序：(ts_sec, ts_usec) 升序，同时间戳按原 idx 保持
+        # 稳定排序：(ts_sec, ts_frac) 升序，同时间戳按原 idx 保持
         records.sort(key=lambda r: (r[0], r[1], r[2]))
 
         tmp = path + ".sorted"
         with open(tmp, "wb") as f:
             f.write(global_header)
-            for ts_sec, ts_usec, _idx, data in records:
-                f.write(struct.pack(endian + "IIII", ts_sec, ts_usec, len(data), len(data)))
+            for ts_sec, ts_frac, _idx, data in records:
+                f.write(struct.pack(endian + "IIII", ts_sec, ts_frac, len(data), len(data)))
                 f.write(data)
         os.replace(tmp, path)
-        logger.info(f"pcap 时间戳重排完成：{path}（{len(records)} 包）")
+        logger.info(f"pcap 时间戳重排完成：{path}（{len(records)} 包，divisor={divisor}）")
         return True
     except Exception as e:
         logger.exception(f"pcap 重排异常 {path}: {e}")

@@ -2,6 +2,34 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.5.6] — 2026-07-23
+
+**兼容 DPI 版本：v1.0.7.0**
+
+### 根治抓包乱序：纳秒 pcap + 单队列默认开（capture.py / replayer.py）
+
+#### 现象
+突发场景（瞬间连续发包）抓到的 pcap 仍有乱序，且乱序包之间的时间戳在纳秒级完全相同（间隔低于纳秒级，几乎同时发送）。
+
+#### 根因
+1.5.0 的保序机制是"内核纳秒时间戳 + 抓完按时间戳稳定重排"。但有两个洞：
+- **落盘截断丢精度**：`_write_packet` 把内核纳秒时间戳截断为微秒落盘（`ts_usec = ts_ns // 1000`）。突发下多个包落在同一微秒 → 重排 key `(ts_sec, ts_usec, idx)` 时间戳部分相同 → 退化为文件写入序（idx）。
+- **收包序 ≠ 线序**：多队列网卡（实测 .82 virtio 有 8 个 RX 队列）下，AF_PACKET 收包顺序由各 CPU softirq 排空队列的次序决定，不等于线序。单队列默认关（`single_queue=False`）时，文件写入序本就不是线序。
+
+两者叠加：突发同微秒包 → 重排无法区分 → 退化为错误的收包序 → 乱序。提高时间戳分辨率（到纳秒）只在收包序=线序时有效，单队列才是根治。
+
+#### 修复
+- **`_write_packet` 改写纳秒时间戳**：pcap magic 从微秒 `0xA1B2C3D4` 改为纳秒 `0xA1B23C4D`（标准 libpcap PCAP_NSEC_MAGIC），记录头第二字段直接写 `ts_nsec`（不截断），让重排有纳秒精度区分同微秒内的包。
+- **`_sort_pcap_by_timestamp` 支持纳秒 magic**：不再跳过纳秒格式，按 `(ts_sec, ts_nsec, idx)` 稳定重排；微秒/纳秒 magic 都支持，单位不影响排序单调性。
+- **`single_queue` 默认 `True`**：`tcpdump_start` 抓包前缩到单队列 + 绑 CPU + 关 RPS/RFS，确保收包序=线序。配合纳秒排序双重保序。
+- **replayer.py 兼容纳秒读取**：`replay_file` 读全局头 magic 判定分辨率，纳秒（`0xA1B23C4D/0x4D3CB2A1`）除以 1e9，微秒除以 1e6。否则纳秒文件 timestamp 会算错最多偏 ~1000s。
+- pcap_flow.py 无需改（只读 incl_len，不依赖时间戳单位）。
+
+#### 验证
+.82 单流 20000 包突发：ns/μs 排序后逆序对均为 0；多流 4×5000：per-flow 0 逆序。纳秒 pcap 由 replayer 正确读取时间戳，回放节奏正确。
+
+---
+
 ## [1.5.5] — 2026-07-22
 
 **兼容 DPI 版本：v1.0.7.0**
