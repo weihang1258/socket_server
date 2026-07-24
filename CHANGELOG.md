@@ -2,6 +2,46 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.6.0] — 2026-07-24
+
+**兼容 DPI 版本：v1.0.7.0**
+
+### 根治同机拨测+抓包丢包：抓包移入独立子进程（capture.py / __init__.py）
+
+#### 现象
+017-过滤-音频URI（入向）用例，A 站（拨测发起方 172.31.138.158，v1.5.6）抓到 7001 包、内核丢 887 包；B 站（被拨测方 10.12.131.183，v1.5.6）抓到 8795 包、内核丢 0 包。A 是发起方、少抓的不是没发——是真切丢了 887 个，`tp_drops` 白纸黑字。
+
+#### 根因（v1.5.2 第 3 层，当时留到 v1.6.0）
+- A 站是拨测**发起方**：`boce.boce()` 在 A 站 socket_server 进程内跑，10 个 `ThreadPoolExecutor` worker 线程与 `AFPacketCapture._recv_loop` 的 recv 线程**同进程抢 GIL**。
+- recv 线程拿不到足够 GIL 去 `recvmsg` drain，AF_PACKET socket 缓冲（8MB）在突发峰值溢出 → 内核 `tp_drops=887`。
+- B 站是被拨测方，进程内无 boce worker，GIL 不被抢 → recv 全速 → 0 丢包。
+- v1.5.2 已判明：rmem/SO_RCVBUF 调大只能拖延溢出，GIL 竞争才是主因（1.5.3 调到 8MB 后 A 仍丢 887 即铁证）。
+- v1.5.6 修的是**乱序**（纳秒 pcap + 单队列保序），未碰丢包这层。
+
+#### 选型（systematic-debugging）
+考虑过 TPACKET_V3 + PACKET_RX_RING 进程内 mmap：V3 块超时退休让唤醒/GIL 获取次数骤减。但 ABI 核实（`/usr/include/linux/if_packet.h`）暴露硬约束——snap=65535（不截断 jumbo，零数据丢失硬需求）下，frame_size=65535 使环仅容 ~1900 包，比现状 8MB 缓冲更易丢；snap=2048 截 jumbo 又违背"零信息丢失"。VLAN 还原在 V3 ring 路径不可靠（内核不设 VLAN_VALID 位，必须额外开 PACKET_AUXDATA）。**单进程内无法同时满足"全帧不截断 + VLAN 还原 + 丢包根治"**。最终选独立子进程：抓包进程独占 GIL，boce worker 抢不到它，recvmsg 在独立进程里就够用，且 snap=65535 全帧 + AUXDATA 还原 VLAN——三个硬需求全满足。
+
+#### 修复
+- **抓包移入独立子进程**：`tcpdump_start` 不再在主 serve 进程起 `AFPacketCapture` 线程，改为 `multiprocessing.Process` 起子进程加载 `_capture_process_main`。独立 GIL，boce 的 worker 线程抢不到抓包进程 → recv 全速 drain → 丢包根治。
+- **启停协议（Pipe + Event）**：子进程 `_open` 成功经 `multiprocessing.Pipe` 回 `("ready",None)`，失败回 `("error",str(exc))`；主进程 `tcpdump_stop` 经 `multiprocessing.Event` 通知子进程收尾。替代旧主进程 `time.sleep(0.5)+查_exc` 盲等（主进程不再 sleep 轮询 _exc；子进程内仍保留一处 sleep(0.5) 作 recv 线程起跑+网卡 down 立即抛出的确认窗口，非盲等）。pcap 仍子进程直写 `path`、主进程 join 后下载——现契约不变，零额外 IPC。
+- **`AFPacketCapture` 类内 recv/VLAN/纳秒落盘/stop 语义全部不变**：仅宿主从"主进程线程"换成"子进程内线程"。`_open`/`_recv_loop`/`_restore_vlan`/`_write_packet`/`_read_stats`/`stop` 均沿用 1.5.2~1.5.6 实现。
+- **子进程内做单队列 + 排序**：`SingleQueueRxThread` 与 `_sort_pcap_by_timestamp` 移入 `_capture_process_main`（内聚：网卡状态改动与保序重排只影响抓包进程）。
+- **`_captures` 注册表**：`path -> (proc, stop_evt)`，`tcpdump_stop` set Event → join 30s → 超时 terminate 兜底（极端异常路径，正常 settimeout(1.0)+stop_evt 必退）。`tcpdump_isrun` 查 `proc.is_alive()`。
+- **PyInstaller onefile 子进程可用**：`socket_listen.py` 已用同款 `multiprocessing.Process(daemon=True)`（v1.5.5 验证），spec 无需改。
+- **退出与丢包边界（daemon + SIGTERM）**：子进程 `daemon=True`。**仅 MCP 层显式调 datatype 6（tcpdump_stop）才走优雅收尾**（stop_evt.set -> cap.stop flush+close -> sort）。systemctl stop/restart 走 SIGTERM，serve 未注册 handler 不调 tcpdump_stop（v1.5.6 线程模型同样如此，非 v1.6.0 回归），daemon 子进程被 systemd cgroup 清理，可能丢最后一批未 flush 包 + 未排序。kill -9/OOM 同理。正常抓包流程（start->拨测->stop->下载）不受影响。
+
+#### VLAN 全帧保留（硬需求）
+- **snaplen 65535**：不截断任何帧（含 jumbo），满足"抓包必抓原始数据、零信息丢失"。
+- **VLAN 还原保留**：开 `PACKET_AUXDATA`，内核把被剥离的 802.1Q 标签放 `tpacket_auxdata` cmsg，`_restore_vlan` 据 cmsg 在 offset 12 插回（对齐 libpcap pcap-linux.c:4302）。V3 ring header 的 `hv1` 字段内核不设 VLAN_VALID 位（ABI 核实），VLAN 必须走 AUXDATA cmsg——进程内 recvmsg 路径天然支持，1.5.3 成果完整保留。
+
+#### rmem/SO_RCVBUF 保留（独立进程下的定位变化）
+- v1.6.0 前曾计划删 `__init__._ensure_sock_buf_limits` + `SO_RCVBUF` 设置（基于 RX_RING 方案：ring 容量替代缓冲）。改独立进程后，缓冲层从"无用治标"变回"独立进程的抗抖动防御层"：GIL 主因已解，但 recv 线程 drain 间隙的瞬时积压仍靠 SO_RCVBUF 缓冲。**保留** rmem_max 8MB（`__init__` 启动期调）+ SO_RCVBUF 4MB（`_open` 设并校验）作为双保险，保"零数据丢失"。rmem 全局副作用 v1.5.3 已接受（serve root 随 systemd 重设）。
+
+#### 验证
+本地 lo 冒烟：子进程启停正常，pcap 纳秒 magic `0xA1B23C4D`、时间戳单调、1693 包 0 逆序。待 CentOS 7 builder 构建后复现 017 用例：A 站"内核丢弃"须为 0（现 887）、包数向 B 站 8795 靠拢；`tcpdump -r`/`pcap_flow.py` 流数、包序、VLAN 层、时间戳单调与 v1.5.6 一致。
+
+---
+
 ## [1.5.6] — 2026-07-23
 
 **兼容 DPI 版本：v1.0.7.0**

@@ -5,6 +5,8 @@ import socket
 import errno
 import logging
 import threading
+import multiprocessing
+import sys
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +42,17 @@ PCAP_MAGIC_NS_BE = 0x4D3CB2A1   # 纳秒，大端（字节序互换）
 
 
 from .netutils import routeinfo
+from . import setup_child_logging
 
 
 class AFPacketCapture:
     """进程内 AF_PACKET 抓包：单线程 recv + 内核纳秒时间戳，直写 pcap。
+
+    v1.6.0 架构变更：本类实例不再跑在主 serve 进程内，而是由 tcpdump_start 起的
+    独立子进程加载（见 _capture_process_main）。独立进程 = 独立 GIL，boce 拨测的
+    10 个 worker 线程抢不到抓包进程的 GIL → recv 线程能全速 drain socket 队列，
+    根治 v1.5.2 第 3 层丢包根因（A 站拨测发起方同机抓包内核丢 887 包）。本类内
+    recv/VLAN/纳秒落盘/stop 语义全部不变，只是宿主从线程换成子进程内的线程。
 
     设计要点：
     - 不起子进程、不发信号、不查 PID：停止 = 关 socket + join 线程 + 关文件。
@@ -53,8 +62,12 @@ class AFPacketCapture:
       且 stop 不还原（持续生效到下次手动调整）；需零侵入时显式传 single_queue=False。
     - 内核纳秒时间戳经 SO_TIMESTAMPNS 取回，以纳秒落盘（PCAP_NSEC_MAGIC 0xA1B23C4D，
       不截断微秒），让 burst 内同微秒的包也能被时间戳区分。读取方据 magic 判定除数。
+    - VLAN 还原：开 PACKET_AUXDATA，内核把被剥离的 802.1Q 标签放 tpacket_auxdata
+      cmsg，_restore_vlan 据 cmsg 在 offset 12 插回（对齐 libpcap pcap-linux.c:4302）。
+      recvmsg 路径天然支持 cmsg，零数据丢失。
+    - snaplen 65535：不截断任何帧（含 jumbo），满足"抓包必抓原始数据、零信息丢失"。
     - promisc 默认开（兼容本机流量与 SPAN 镜像口），失败只 warn 不 abort。
-    - 每路抓包一个实例，按 path 注册到 _captures，天然支持同机多 path 并发。
+    - 每路抓包一个子进程实例，按 path 注册到 _captures，天然支持同机多 path 并发。
     """
 
     def __init__(self, eth, path, extended=""):
@@ -94,6 +107,9 @@ class AFPacketCapture:
         # 不报错。setsockopt 之后必须 getsockopt 验证实际生效值——若被截断，记 warning
         # 提示 sysctl，否则 boce 突发下 AF_PACKET socket 缓冲溢出、recv 线程来不及
         # drain 的包会被内核丢，且 stop 路径下 tp_drops 才能被准确读到。
+        # v1.6.0：抓包已移到独立子进程，GIL 不被 boce worker 抢（根治 v1.5.2 第 3 层
+        # 丢包根因）。但 recv 线程 drain 间隙的瞬时积压仍靠 SO_RCVBUF 缓冲，这里设大
+        # + __init__ 调大 rmem_max，双保险保"零数据丢失"。GIL 主因已解，此层退为抗抖动。
         REQUEST_RCVBUF = 4 * 1024 * 1024
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, REQUEST_RCVBUF)
@@ -284,12 +300,96 @@ class AFPacketCapture:
         return True
 
 
+def _capture_process_main(eth, path, extended, single_queue, ready_conn, stop_evt):
+    """抓包子进程入口（v1.6.0）。
+
+    在独立进程内跑 AFPacketCapture，与主 serve 进程隔离 GIL（boce 拨测的 worker 线程
+    抢不到本进程 GIL），recv 线程全速 drain，根治 v1.5.2 第 3 层丢包根因（A 站拨测
+    发起方同机抓包内核丢 887 包）。
+
+    与主进程的协议（multiprocessing）：
+    - ready_conn（Pipe 的一端）：_open 成功发 ("ready", None)；失败发 ("error", str(exc))。
+      替代旧主进程 time.sleep(0.5)+查_exc 的盲等：主进程不再 sleep 轮询 _exc，改为阻塞等
+      子进程明确的就绪/失败信号。子进程内仍保留一处 sleep(0.5)（见下注释，非盲等）。
+    - stop_evt（Event）：主进程 stop 时 set()。本入口主线程 wait() 醒后调 cap.stop()
+      收尾（join recv 线程 -> 读内核统计 -> close socket -> flush/close pcap），再调
+      _sort_pcap_by_timestamp 纳秒重排（抓包的子进程最清楚自己写的文件）。
+    - pcap 文件：子进程直写 path（共享文件系统），主进程 join 后下载，现契约不变。
+
+    单队列配置也在子进程做（内聚：网卡状态改动只影响抓包进程）。任何异常经 ready_conn
+    回传后子进程退出；主进程读不到 ready 视为启动失败。
+    """
+    # 日志初始化：fork 下继承主进程 handler（复用），spawn 下重建（否则子进程日志静默丢失，
+    # _recv_loop 网卡 down 诊断、tp_drops 告警全消失）。socket_listen 子进程已是此模式。
+    setup_child_logging()
+
+    # 单队列 + CPU 绑定（收包序=线序，根治多队列 RSS 乱序）
+    if single_queue:
+        logger.info(f"配置网卡 {eth} 为单队列模式（默认开启）")
+        try:
+            SingleQueueRxThread(eth=eth, count=1)
+        except Exception as e:
+            logger.warning(f"单队列配置失败(忽略，仍可抓包): {e}")
+
+    def _send_and_close(msg):
+        """回传 ready/error 并关闭写端，保证每条返回路径都不漏 fd。"""
+        try:
+            ready_conn.send(msg)
+        except Exception:
+            pass
+        try:
+            ready_conn.close()
+        except Exception:
+            pass
+
+    cap = AFPacketCapture(eth=eth, path=path, extended=extended)
+    try:
+        cap.start()
+    except Exception as e:
+        logger.exception(f"启动抓包失败 {eth} -> {path}: {e}")
+        _send_and_close(("error", str(e)))
+        return
+    # sleep(0.5)：给收包线程起跑 + 网卡 down/消失时 _recv_loop 的 ENETDOWN 立即抛 _exc 的窗口。
+    # 不是"盲等"（盲等已由 ready 信号替代），而是确认 recv 线程稳定存活后再回报就绪，避免
+    # 线程刚 start 尚未进入 recvmsg 循环就因网卡问题退出、却已报 ready 的假阳性。
+    time.sleep(0.5)
+    if cap._exc is not None:
+        logger.error(f"抓包启动失败 {eth} -> {path}: {cap._exc}")
+        cap.stop()
+        _send_and_close(("error", str(cap._exc)))
+        return
+    if cap._thread is None or not cap._thread.is_alive():
+        logger.error(f"抓包线程未存活 {eth} -> {path}")
+        cap.stop()
+        _send_and_close(("error", "抓包线程未存活"))
+        return
+    _send_and_close(("ready", None))  # 回传完毕关闭写端，避免 fd 泄漏（主进程 recv 后也关读端）
+    logger.info(f"已开启抓包(子进程 PID={os.getpid()}) {eth} -> {path}（extended={extended!r}, single_queue={single_queue}）")
+
+    # 轮询等停止信号或 recv 线程退出：纯 stop_evt.wait() 在 recv 线程崩溃/网卡 down 后仍阻塞，
+    # 致子进程存活、tcpdump_isrun 误报 True（v1.5.6 查线程存活无此问题，此处恢复语义）。
+    while not stop_evt.wait(1.0):
+        if cap._thread is None or not cap._thread.is_alive():
+            logger.error(f"抓包 recv 线程已退出 {eth} -> {path}（网卡 down 或异常），停止抓包")
+            break
+    # 收尾：cap.stop() 返回 False 表示 recv 线程 10s 未退出、文件未 flush/close--此时不应 sort
+    # （避免读未 flush 数据 os.replace 覆盖致截断 pcap）。
+    stop_ok = cap.stop()
+    sort_ok = True
+    if stop_ok and os.path.isfile(path):
+        sort_ok = _sort_pcap_by_timestamp(path)
+        if not sort_ok:
+            logger.error(f"pcap 时间戳重排失败，保留原文件：{path}")
+    if not stop_ok or not sort_ok:
+        sys.exit(1)  # 退出码非 0 通知主进程本轮 pcap 可能不完整（主进程查 exitcode 返回 False）
+
+
 def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue=True):
-    """开启抓包（进程内 AF_PACKET）。
+    """开启抓包（独立子进程 AF_PACKET，v1.6.0）。
 
     签名兼容 datatype 5 / MCP capture_start：eth/path/extended/single_queue。
-    single_queue 默认 True：缩到单队列 + 绑 CPU + 关 RPS/RFS，确保收包序=线序，
-    配合纳秒时间戳排序实现保序（根治多队列 RSS 乱序）。
+    起独立子进程跑 AFPacketCapture，与主 serve 进程隔离 GIL，根治 boce 同机抓包
+    丢包（v1.5.2 第 3 层 GIL 竞争根因）。single_queue 默认 True：收包序=线序。
     """
     if not eth:
         rt = routeinfo().get("0.0.0.0") or {}
@@ -297,14 +397,6 @@ def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue
         if not eth:
             logger.error("未指定网卡且系统无默认路由，无法确定抓包网卡")
             return False
-
-    # 单队列 + CPU 绑定（默认开启：收包序=线序，根治多队列 RSS 乱序）
-    if single_queue:
-        logger.info(f"配置网卡 {eth} 为单队列模式（默认开启）")
-        try:
-            SingleQueueRxThread(eth=eth, count=1)
-        except Exception as e:
-            logger.warning(f"单队列配置失败(忽略，仍可抓包): {e}")
 
     # 清旧文件
     try:
@@ -318,67 +410,118 @@ def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue
         old = _captures.get(path)
     if old is not None:
         logger.warning(f"path {path} 已有抓包在运行，先停止旧实例")
-        old.stop()
+        _stop_capture_entry(old)
         with _captures_lock:
             _captures.pop(path, None)
 
-    cap = AFPacketCapture(eth=eth, path=path, extended=extended)
+    # Pipe：子进程回传 ready/error（替代旧 sleep0.5 盲等）
+    parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
+    stop_evt = multiprocessing.Event()
+    proc = multiprocessing.Process(
+        target=_capture_process_main,
+        args=(eth, path, extended, single_queue, child_conn, stop_evt),
+        daemon=True,
+    )
     try:
-        cap.start()
+        proc.start()
     except Exception as e:
-        logger.exception(f"启动抓包失败 {eth} -> {path}: {e}")
+        logger.exception(f"启动抓包子进程失败 {eth} -> {path}: {e}")
+        for c in (parent_conn, child_conn):
+            try:
+                c.close()
+            except Exception:
+                pass
         return False
-    # 起后短暂等待，确认线程存活且无异常（对照旧实现起后检查语义）
-    time.sleep(0.5)
-    # 先查 _exc：_recv_loop 对网卡 down/消失已记过明确原因，这里补一句启动失败即可，
-    # 避免再打含糊的"线程未存活"掩盖真实原因（见 10.12.131.35 故障）。
-    if cap._exc is not None:
-        logger.error(f"抓包启动失败 {eth} -> {path}: {cap._exc}")
-        cap.stop()
+    # 子进程已 fork 继承 child_conn 副本，主进程的 child_conn 引用不再需要，显式关避免依赖 GC
+    try:
+        child_conn.close()
+    except Exception:
+        pass
+
+    # 等子进程就绪信号（带超时兜底：进程崩溃/异常不卡死主流程）
+    status = None
+    err = None
+    try:
+        if parent_conn.poll(10):
+            msg = parent_conn.recv()
+            status, err = msg
+        else:
+            status, err = "error", "子进程启动超时(10s)未就绪"
+    except (EOFError, OSError) as e:
+        status, err = "error", f"读取子进程就绪信号失败: {e}"
+    finally:
+        try:
+            parent_conn.close()  # 读端关闭，避免 fd 泄漏
+        except Exception:
+            pass
+
+    if status != "ready":
+        logger.error(f"抓包启动失败 {eth} -> {path}: {err}")
+        # 回收子进程
+        stop_evt.set()
+        proc.join(timeout=5)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=3)
         return False
-    if cap._thread is None or not cap._thread.is_alive():
-        logger.error(f"抓包线程未存活 {eth} -> {path}")
-        cap.stop()
-        return False
+
     with _captures_lock:
-        _captures[path] = cap
-    logger.info(f"已开启抓包 {eth} -> {path}（extended={extended!r}, single_queue={single_queue}）")
+        _captures[path] = (proc, stop_evt)
+    logger.info(f"已开启抓包(子进程 PID={proc.pid}) {eth} -> {path}（extended={extended!r}, single_queue={single_queue}）")
     return True
 
 
+def _stop_capture_entry(entry):
+    """停止单个抓包子进程（proc, stop_evt）。
+
+    stop_evt.set() 通知子进程收尾（cap.stop + sort）；join 超时则 terminate 兜底。
+    返回 True/False（对齐旧 cap.stop() 语义，失败保留实例可重试）。
+    """
+    proc, stop_evt = entry
+    if not proc.is_alive():
+        return True
+    stop_evt.set()
+    proc.join(timeout=30)  # = cap.stop 内 recv 线程 join 10s + sort 冗余，30s 足够
+    if not proc.is_alive():
+        return True
+    # 超时未退出：强制终止（极端情况下可能丢最后一批未 flush 的包，属异常路径）
+    logger.error(f"抓包子进程停止超时(>30s)，强制终止：{proc.pid}")
+    proc.terminate()
+    proc.join(timeout=5)
+    return not proc.is_alive()
+
+
 def tcpdump_stop(path="/home/tmp/tmp.pcap"):
-    """停止抓包并按时间戳稳定重排 pcap。
+    """停止抓包（独立子进程，v1.6.0）。
 
-    幂等：path 未在抓直接返回 True。停止 = 关 socket + join 线程，无信号无 PID。
-    抓完调 _sort_pcap_by_timestamp 保证时间戳单调（根治多队列/RSS 乱序）。
-
-    停止失败（join 超时）：实例保留在 _captures 不移除，避免孤立线程泄漏；
-    调用方可重试 stop 直到成功。
+    幂等：path 未在抓直接返回 True。stop_evt.set 通知子进程收尾（cap.stop + sort），
+    无信号无 PID。停止失败（join 超时）：实例保留在 _captures 不移除，可重试 stop。
     """
     with _captures_lock:
-        cap = _captures.get(path)
-    if cap is None:
+        entry = _captures.get(path)
+    if entry is None:
         return True  # 幂等：未在抓
-    ok = cap.stop()
+    ok = _stop_capture_entry(entry)
     if not ok:
         # 保留注册表条目，调用方可重试 stop；isrun 仍返回 True
-        logger.error(f"停止抓包未完成（线程可能仍在运行），保留实例可重试：{path}")
+        logger.error(f"停止抓包未完成（子进程可能仍在运行），保留实例可重试：{path}")
         return False
     with _captures_lock:
         _captures.pop(path, None)
-    # 抓完按时间戳稳定重排（核心保序步骤）
-    if os.path.isfile(path):
-        if not _sort_pcap_by_timestamp(path):
-            logger.error(f"pcap 时间戳重排失败，保留原文件：{path}")
-            return False
+    # 子进程退出码反映 cap.stop()/sort 成败（_capture_process_main 内 sys.exit(1)）：
+    # 非 0 则本轮 pcap 可能不完整/未排序，返回 False 让调用方感知（恢复 v1.5.6 失败信号传播）。
+    code = entry[0].exitcode
+    if code not in (0, None):
+        logger.warning(f"抓包子进程退出码 {code}，本轮 pcap 可能不完整/未排序：{path}")
+        return False
     return True
 
 
 def tcpdump_isrun(path="/home/tmp/tmp.pcap"):
-    """返回 (running, [path])。查 _captures 注册表，替代旧的 pgrep/proc 解析。"""
+    """返回 (running, [path])。查 _captures 子进程是否存活。"""
     with _captures_lock:
-        cap = _captures.get(path)
-    if cap is not None and cap._thread is not None and cap._thread.is_alive():
+        entry = _captures.get(path)
+    if entry is not None and entry[0].is_alive():
         return True, [path]
     return False, []
 

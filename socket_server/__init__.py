@@ -31,6 +31,32 @@ def setup_logging(log_file="/var/log/socket_server.log"):
         logger.addHandler(_fh)
 
 
+def setup_child_logging(log_file="/var/log/socket_server.log"):
+    """抓包子进程（capture.py _capture_process_main）入口日志初始化。
+
+    fork 模式下子进程继承主进程的 handler（_ch 已非 None），无需重复添加，直接复用--
+    与主进程共享同一 FileHandler 的底层 fd。fork 下多进程并发写同一日志文件会行交错乱，
+    但 socket_listen.py 的监听子进程已是此模式，本服务既定约定，可接受。
+    spawn 模式（未来 PyInstaller 某些场景）下子进程不继承 handler（_ch 为 None），必须重建，
+    否子进程所有 logger 输出静默丢失（_recv_loop 网卡 down 诊断、tp_drops 告警全消失）。
+    """
+    global _ch, _fh
+    if _ch is not None:
+        return  # fork：已继承，复用
+    # spawn：从头建（与 setup_logging 同构，但不写 _ch 全局标记副作用以外的逻辑）
+    _ch = logging.StreamHandler()
+    _ch.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    _ch.setFormatter(formatter)
+    logger.addHandler(_ch)
+    log_dir = os.path.dirname(log_file)
+    if os.path.isdir(log_dir):
+        _fh = logging.FileHandler(log_file, encoding='utf-8')
+        _fh.setLevel(logging.INFO)
+        _fh.setFormatter(formatter)
+        logger.addHandler(_fh)
+
+
 # 抓包工具初始化（延迟到 setup_environment）
 _sniff_command = None
 
@@ -50,10 +76,11 @@ def init_capture():
 def _ensure_sock_buf_limits():
     """serve 启动时确保 net.core.rmem_max/wmem_max >= 8MB。
 
-    boce 突发下 AF_PACKET socket 缓冲若被 rmem_max 静默截断（默认 212992 仅 416KB）
-    会丢包（v1.5.2 已加 SO_RCVBUF 截断检测告警，但只告警不修）。serve 以 root 运行，
-    写 /proc/sys 即时全局生效；随 systemd 每次启动重设，等价持久，不碰 /etc。
-    <8MB 才写，>=8MB 不动；失败只 warn 不阻断 serve。
+    抓包在独立子进程（capture.py _capture_process_main），GIL 不被 boce worker
+    抢（根治 v1.5.2 第 3 层丢包根因）。但子进程 recv 线程 drain 间隙的瞬时积压
+    仍靠 SO_RCVBUF 缓冲；rmem_max 默认仅 212992（208KB），IO 抖动下可能瞬时溢出。
+    serve 以 root 运行，写 /proc/sys 即时全局生效；随 systemd 每次启动重设，
+    等价持久，不碰 /etc。<8MB 才写，>=8MB 不动；失败只 warn 不阻断 serve。
     """
     TARGET = 8 * 1024 * 1024
     for name in ("net/core/rmem_max", "net/core/wmem_max"):
