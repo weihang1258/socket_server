@@ -28,8 +28,16 @@ SOL_PACKET = 263
 PACKET_ADD_MEMBERSHIP = 1
 PACKET_MR_PROMISC = 1
 PACKET_AUXDATA = 8             # setsockopt(SOL_PACKET, PACKET_AUXDATA,1) → 内核在 cmsg 附带 tpacket_auxdata（含被剥离的 VLAN）
-SO_TIMESTAMPNS = 35          # 内核纳秒时间戳
+SO_TIMESTAMPNS = 35          # 内核纳秒时间戳（L2 层）
+SO_TIMESTAMPING = 37        # 内核多源时间戳（L0/L1 层，HW+SW）：SOF_TIMESTAMPING_* 组合
 SO_ATTACH_FILTER = 26        # 经典 BPF 过滤器
+# SO_TIMESTAMPING flags（linux/socket.h），请求内核打哪些时间戳
+SOF_TIMESTAMPING_RX_SOFTWARE = 1 << 3   # 软中断 RX 时间戳（ts[1]，等同 SO_TIMESTAMPNS）
+SOF_TIMESTAMPING_RX_HARDWARE = 1 << 2   # 硬件 RX 时间戳（ts[0]，网卡 PHC，亚纳秒）——核对 linux/net_tstamp.h:20
+SOF_TIMESTAMPING_RAW_HARDWARE  = 1 << 6  # 配合 RX_HARDWARE，cmsg 给原始 PHC 时钟 cycles
+SCM_TIMESTAMPING = 37        # SO_TIMESTAMPING 产出的 cmsg type（与 SO_TIMESTAMPING 同值，历史命名）
+# scm_timestamping cmsg = struct[3] { timespec ts[0]HW ts[1]SW ts[2](unused) }，每 timespec 16B（@ll）
+SCM_TIMESTAMPING_SIZE = 48
 # tpacket_auxdata.tp_status 位：内核在收包前已把 802.1Q 标签剥到 skb 元数据，auxdata 携带还原信息
 TP_STATUS_VLAN_VALID = 0x10       # bit4: tp_vlan_tci 有效
 TP_STATUS_VLAN_TPID_VALID = 0x40  # bit6: tp_vlan_tpid 有效
@@ -81,6 +89,15 @@ class AFPacketCapture:
         self._exc = None  # 收包线程内异常（start 后检查）
         self._pkt_count = 0
         self._dropped = 0
+        # 时间戳精度模式（_open 探测，_recv_loop 据此解码 cmsg）：
+        # 'hw_ts'  -> SO_TIMESTAMPING 硬件 RX（网卡 PHC，亚纳秒，mlx5/ixgbe 物理网卡支持）
+        # 'sw_ts'  -> SO_TIMESTAMPING 软中断 RX（纳秒，等同 SO_TIMESTAMPNS，virtio 等）
+        # 'ns_ts'  -> SO_TIMESTAMPNS（纳秒，老内核/驱动不支持 SO_TIMESTAMPING 的兜底）
+        # 'userspace' -> time.monotonic_ns() 在 recvmsg 返回时取（微秒级，全失败的兜底）
+        self._ts_mode = 'userspace'
+        # hw_ts 模式下若 cmsg ts[0] 全零（驱动/内核未填 PHC），退化软中断 ts[1]；
+        # 首次退化 warn 一次，让 35 mlx5 这类声称支持 HW 的网卡能一眼看出 HW 是否真生效（不静默退化）。
+        self._hw_degraded_warned = False
 
     def _open(self):
         # proto=0 创建：packet_create（af_packet.c:3393）仅在 proto!=0 时 __register_prot_hook
@@ -89,11 +106,32 @@ class AFPacketCapture:
         # 附上前"的未过滤窗口（10.12.131.32 实测：bind 到 BPF 附加间隔 ~412ms，期间
         # ARP/UDP/非目标 flag 包漏进缓冲污染抓包结果）。
         s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, 0)
-        # 纳秒时间戳：内核为每个包打 SO_TIMESTAMPNS，ancdata 取回
+        # 时间戳精度自动降级（v1.6.1）：优先硬件时间戳（网卡 PHC，亚纳秒），逐层降到软件
+        # 纳秒、再降 SO_TIMESTAMPNS、最后用户态。一次性 setsockopt 探测存 self._ts_mode，
+        # _recv_loop 据此解码 cmsg。SO_TIMESTAMPING 是 SO_TIMESTAMPNS 的超集（同时支持
+        # HW+SW，cmsg 给 ts[3]），HW 是否可用由 cmsg ts[0] 是否非零判定（无需预探测硬件支持）。
+        #   L0 hw_ts：setsockopt SOF_TIMESTAMPING_RX_HARDWARE|RX_SOFTWARE|RAW_HARDWARE
+        #             -> cmsg ts[0] 非零则用 hw（亚纳秒 PHC），ts[0]==0 退 ts[1]（软中断纳秒）
+        #   L1 sw_ts：L0 setsockopt 失败（ENOPROTOOPT）-> 退 SO_TIMESTAMPING 仅 RX_SOFTWARE
+        #             -> cmsg ts[1]（等同 SO_TIMESTAMPNS）
+        #   L2 ns_ts：L1 也失败 -> SO_TIMESTAMPNS（老内核 2.6.x，极罕见）
+        #   L3 userspace：L2 也失败 -> recvmsg 返回时 time.monotonic_ns()（精度最低，兜底）
+        ts_flags = SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RX_SOFTWARE | SOF_TIMESTAMPING_RAW_HARDWARE
         try:
-            s.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS, 1)
-        except OSError as e:
-            logger.warning(f"网卡 {self.eth} 不支持 SO_TIMESTAMPNS: {e}，回退到用户态时间戳（保序精度降低）")
+            s.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPING, ts_flags)
+            self._ts_mode = 'hw_ts'  # 实际精度由 cmsg ts[0] 是否非零在 _decode_ts 内判定
+        except OSError:
+            try:
+                s.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPING, SOF_TIMESTAMPING_RX_SOFTWARE)
+                self._ts_mode = 'sw_ts'
+            except OSError:
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS, 1)
+                    self._ts_mode = 'ns_ts'
+                except OSError as e:
+                    self._ts_mode = 'userspace'
+                    logger.warning(f"网卡 {self.eth} 不支持任何内核时间戳（{e}），回退用户态时间戳（保序精度最低）")
+        logger.info(f"网卡 {self.eth} 时间戳精度模式: {self._ts_mode}（hw=亚纳秒PHC/sw+ns=纳秒软中断/userspace=微秒）")
         # 请求内核在 ancdata 附带 tpacket_auxdata（含被剥离的 VLAN TCI/TPID）。
         # AF_PACKET 收包时内核已把 802.1Q 标签从帧里剥到 skb 元数据（net/core/dev.c 的
         # skb_vlan_untag / af_packet.c 的 tp_vlan_tci），不开 AUXDATA 就拿不到，落盘 pcap
@@ -184,21 +222,51 @@ class AFPacketCapture:
                     break
                 if not data:
                     break
-                ts_ns = self._extract_ts_ns(ancdata)
+                ts_ns = self._decode_ts_ns(ancdata)
                 frame = self._restore_vlan(data, ancdata)
                 self._write_packet(frame, ts_ns)
         except Exception as e:
             self._exc = e
             logger.exception(f"抓包线程异常 {self.eth} -> {self.path}")
 
-    def _extract_ts_ns(self, ancdata):
-        """从 ancdata 取 SO_TIMESTAMPNS 的 timespec(秒, 纳秒)，回退到 time.time_ns()。"""
-        for cmsg_level, cmsg_type, cmsg_data in ancdata:
-            if cmsg_level == socket.SOL_SOCKET and cmsg_type == SO_TIMESTAMPNS:
-                # struct timespec { time_t tv_sec; long tv_nsec; }，@ll 按平台 long 宽度对齐
-                tv_sec, tv_nsec = struct.unpack("@ll", cmsg_data)
-                return tv_sec * 1_000_000_000 + tv_nsec
-        return time.time_ns()
+    def _decode_ts_ns(self, ancdata):
+        """据 self._ts_mode 从 ancdata 解码纳秒时间戳，回退到 time.monotonic_ns()。
+
+        - 'hw_ts'/'sw_ts'：取 SCM_TIMESTAMPING cmsg（struct[3] timespec，ts[0]HW ts[1]SW ts[2]unused）。
+          hw_ts 模式下 ts[0] 非零用硬件（亚纳秒 PHC），ts[0]==0 退 ts[1]（软中断纳秒）--由 cmsg 内容
+          自适应，不依赖预探测硬件支持（驱动/内核不给 HW 就自动降级，与 setsockopt 时探测解耦）。
+          sw_ts 模式下直接用 ts[1]。
+        - 'ns_ts'：取 SO_TIMESTAMPNS cmsg（单 timespec）。
+        - 'userspace'：cmsg 无时间戳，调用点用 time.monotonic_ns()（_recv_loop 已包此分支）。
+        timespec 用 @ll 解（time_t + long，按平台 long 宽度对齐，与 SO_TIMESTAMPNS 同）。
+        """
+        if self._ts_mode in ('hw_ts', 'sw_ts'):
+            for cmsg_level, cmsg_type, cmsg_data in ancdata:
+                if cmsg_level == socket.SOL_SOCKET and cmsg_type == SCM_TIMESTAMPING:
+                    if len(cmsg_data) < SCM_TIMESTAMPING_SIZE:
+                        break  # cmsg 长度不足（ABI 异常），退 userspace
+                    # 3 个 timespec，每个 @ll = 16B
+                    hw_sec, hw_nsec, sw_sec, sw_nsec, _u1, _u2 = struct.unpack("@llllll", cmsg_data[:SCM_TIMESTAMPING_SIZE])
+                    if self._ts_mode == 'hw_ts' and (hw_sec or hw_nsec):
+                        return hw_sec * 1_000_000_000 + hw_nsec  # 硬件时间戳（亚纳秒 PHC）
+                    if sw_sec or sw_nsec:
+                        # hw_ts 模式但 ts[0] 零 -> HW 未生效（网卡声称支持但驱动未填 PHC，如 virtio/lo），
+                        # 退化软中断纳秒。首次 warn 一次，便于诊断 HW 是否真用上（35 mlx5 验证用）。
+                        if self._ts_mode == 'hw_ts' and not self._hw_degraded_warned:
+                            logger.warning(
+                                f"网卡 {self.eth} 硬件时间戳未生效（ts[0]=0），退化软中断纳秒。"
+                                f"ethtool -T 显示 hardware-receive 但驱动未填 PHC，HW 时间戳未真正启用"
+                            )
+                            self._hw_degraded_warned = True
+                        return sw_sec * 1_000_000_000 + sw_nsec  # 软中断时间戳（纳秒）
+                    break  # ts[0]/ts[1] 都零（内核未打），退 userspace
+        elif self._ts_mode == 'ns_ts':
+            for cmsg_level, cmsg_type, cmsg_data in ancdata:
+                if cmsg_level == socket.SOL_SOCKET and cmsg_type == SO_TIMESTAMPNS:
+                    tv_sec, tv_nsec = struct.unpack("@ll", cmsg_data)
+                    return tv_sec * 1_000_000_000 + tv_nsec
+        # userspace 模式 / hw_ts|sw_ts 但 cmsg 缺失或 ts 全零 -> 调用点取单调纳秒
+        return time.monotonic_ns()
 
     def _restore_vlan(self, data, ancdata):
         """若内核 auxdata 标记帧带 VLAN，把被剥离的 802.1Q 标签插回 offset 12，还原在线帧。

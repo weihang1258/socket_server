@@ -2,6 +2,41 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.6.1] — 2026-07-24
+
+**兼容 DPI 版本：v1.0.7.0**
+
+### 时间戳精度自动降级：优先硬件亚纳秒，逐层兜底（capture.py）
+
+#### 背景
+v1.5.6/1.6.0 用 `SO_TIMESTAMPNS` 取内核软中断纳秒时间戳保序。软中断时刻是包进入 net_rx_action 的时刻，非线缆到达时刻，burst 下同纳秒的包仍可能时间戳相同。35 的 mlx5 物理网卡支持硬件时间戳（`ethtool -T` 显示 `hardware-receive` + PHC），可达亚纳秒（网卡 PHC 线缆到达时刻），是同纳秒包区分先后的天花板。virtio（A/B 站）不支持硬件时间戳。
+
+#### 修复
+`_open` 一次性探测 setsockopt，存 `self._ts_mode`，`_decode_ts_ns` 据模式解码 cmsg，自动降级：
+
+- **L0 `hw_ts`**：`setsockopt(SO_TIMESTAMPING, RX_HARDWARE|RX_SOFTWARE|RAW_HARDWARE)`。网卡支持 HW 时 cmsg `ts[0]` 非零，取硬件时间戳（亚纳秒 PHC，线缆到达时刻）；驱动/内核不给 HW 则 `ts[0]==0`，自动退 `ts[1]`（软中断纳秒）。**HW 是否可用由 cmsg 内容判定，不依赖预探测**（setsockopt 成功≠HW 真生效，需看 ts[0]）。
+- **L1 `sw_ts`**：L0 setsockopt 失败（ENOPROTOOPT）退 `setsockopt(SO_TIMESTAMPING, RX_SOFTWARE)`，取 cmsg `ts[1]`（等同 SO_TIMESTAMPNS）。
+- **L2 `ns_ts`**：L1 也失败退 `SO_TIMESTAMPNS`（老内核/驱动不支持 SO_TIMESTAMPING）。
+- **L3 `userspace`**：L2 也失败退 `time.monotonic_ns()` 在 recvmsg 返回时取（微秒级，全失败兜底）。
+
+各网卡实测预期：35 mlx5 -> `hw_ts`（PHC 亚纳秒）；A/B virtio -> `hw_ts` 模式但 ts[0] 始终零，自动取 ts[1] 纳秒（等价软中断）；老 CentOS 6 / 不支持驱动 -> `ns_ts` 或 `userspace`。日志每次抓包打 `时间戳精度模式: <mode>`。
+
+#### 设计要点
+- `SO_TIMESTAMPING` 是 `SO_TIMESTAMPNS` 的超集（同时支持 HW+SW），优先用之，cmsg 给 `scm_timestamping`（3 个 timespec 48B：HW/SW/unused）。原 `SO_TIMESTAMPNS` 路径作为 L2 兜底保留。
+- HW 优先但 SW 共存：一次 setsockopt 同时请求 HW+SW，内核能给 HW 就填 ts[0]、给不了就填 ts[1]，`_decode_ts_ns` 据 ts[0] 是否非零自适应——**不需要"知道硬件是否支持"的预探测**，全靠 cmsg 内容。
+- 保序不回归：时间戳精度提升不改变 `_sort_pcap_by_timestamp` 纳秒重排逻辑（HW/SW 都是纳秒级整数，落盘仍是 PCAP_NSEC_MAGIC 纳秒 pcap，排序 key `(ts_sec, ts_nsec, idx)` 不变）。
+- 纳秒 pcap 落盘不变：HW 时间戳虽亚纳秒，落盘截断到纳秒（pcap 格式精度上限），但相比软中断时间戳已消除"net_rx_action 排队抖动"，同纳秒包大幅减少。
+
+#### 验证
+本地 lo 冒烟：ts_mode 探测正常、pcap 纳秒 magic `0xA1B23C4D`、时间戳单调。待 CentOS 7 builder 构建后：35 mlx5 跑抓包确认日志 `时间戳精度模式: hw_ts` 且 cmsg ts[0] 非零；A/B virtio 确认 ts[1] 纳秒。各模式包序与 v1.6.0 一致。
+
+### review 修法（capture.py）
+
+- **bug：`SOF_TIMESTAMPING_RX_HARDWARE` 位定义错**：原 `1<<4`（实为 `SOF_TIMESTAMPING_SOFTWARE` 全局软件位），应是 `1<<2`（核对 `/usr/include/linux/net_tstamp.h:20`）。位错致内核没收到 RX 硬件时间戳请求 → cmsg `ts[0]` 永远零 → `_decode_ts_ns` 永远退化软中断 → **35 mlx5 的 PHC 也用不上，1.6.1 等于白做**（静默失效，冒烟能过因 lo 本就无 HW）。修为 `1<<2`，组合 flags 从错位 88 修正为 76（0x4C）。
+- **诊断：HW 未生效不静默退化**：`_decode_ts_ns` 在 `hw_ts` 模式下 cmsg `ts[0]==0`（驱动/内核未填 PHC，如 virtio/lo）退化软中断时，首次 warn 一次"硬件时间戳未生效，退化软中断纳秒"。让 35 mlx5 这类声称支持 HW 的网卡能一眼看出 HW 是否真用上（不静默退化），诊断闭环。正常路径不刷屏（仅首次）、不破坏保序。
+
+---
+
 ## [1.6.0] — 2026-07-24
 
 **兼容 DPI 版本：v1.0.7.0**
