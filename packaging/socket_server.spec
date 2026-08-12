@@ -45,6 +45,7 @@ a = Analysis(
         'socket_server.release_notes',
         'scapy.all',
         'scapy.arch.linux',
+        'fcntl',  # scapy.arch.linux 顶层 import；PyInstaller 静态分析漏收 fcntl，漏则带 BPF 抓包 ModuleNotFoundError
         'scapy.layers.l2',
         'scapy.layers.inet',
         'scapy.layers.inet6',

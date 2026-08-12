@@ -2,6 +2,35 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.6.2] — 2026-08-12
+
+**兼容 DPI 版本：v1.0.7.0**
+
+### 修复带 BPF 抓包启动失败：spec 补 `fcntl`（packaging/socket_server.spec）
+
+#### 现象
+带 `extended`（BPF 过滤）的抓包启动失败，日志：
+```
+开启tcpdump抓包 参数：{'eth': 'enp6s0f1', 'extended': 'tcp[13] == 0x1c', ...}
+网卡 enp6s0f1 时间戳精度模式: hw_ts
+启动抓包失败：BPF 过滤编译失败(tcp[13] == 0x1c): No module named 'fcntl'
+```
+`.32` enp6s0f1 封堵用例抓包现场复现。
+
+#### 根因
+- `fcntl`（Python 标准库）**未被打进 PyInstaller onefile 二进制**。
+- `scapy/arch/linux/__init__.py:11` 顶层 `import fcntl`；`_open` 在 `extended` 非空时才延迟 import `scapy.arch.linux`（attach_filter），frozen importer 找不到 `fcntl` → ModuleNotFoundError。
+- 触发条件：**只有带 BPF 的抓包**（extended 非空）。不带 extended 的抓包不 import scapy，不炸。A/B 站 017 封堵用例的 `host x and port 8000` 也带 extended，同样受影响。
+- 与 1.6.1 时间戳改动**无关**（时间戳 `hw_ts` 模式已正常初始化）；是 PyInstaller 静态分析漏收标准库模块，1.5.0 补 `scapy.arch.linux` 为同款先例。
+
+#### 修复
+`socket_server.spec` hiddenimports 补 `'fcntl'`，强制打进二进制。三行纯 spec 改动，零代码。
+
+#### 验证
+待 CentOS 7 builder 构建后：`.32` 带 `tcp[13]==0x1c` 抓包启动成功、日志无 ModuleNotFoundError、抓包正常落盘。
+
+---
+
 ## [1.6.1] — 2026-07-24
 
 **兼容 DPI 版本：v1.0.7.0**
