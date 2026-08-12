@@ -148,7 +148,10 @@ class AFPacketCapture:
         # v1.6.0：抓包已移到独立子进程，GIL 不被 boce worker 抢（根治 v1.5.2 第 3 层
         # 丢包根因）。但 recv 线程 drain 间隙的瞬时积压仍靠 SO_RCVBUF 缓冲，这里设大
         # + __init__ 调大 rmem_max，双保险保"零数据丢失"。GIL 主因已解，此层退为抗抖动。
-        REQUEST_RCVBUF = 4 * 1024 * 1024
+        # v1.6.3：32MB——镜像口环境有并发流量（llcj 批量回放）时，回放突发 + 并发流叠加
+        # 可能瞬时填满 4MB 缓冲导致内核丢包（35 实测 65850 帧的并发场景）。32MB = 8MB
+        # rmem_max 的 4 倍，recv 线程 12.5s 内足够吞下任意并发突发。
+        REQUEST_RCVBUF = 32 * 1024 * 1024
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, REQUEST_RCVBUF)
             actual = s.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
@@ -203,6 +206,11 @@ class AFPacketCapture:
     def _recv_loop(self):
         # 纯收包循环：内核统计由 stop() 在 join 之后、close 之前调 _read_stats 读取
         # （recv 线程在此不去碰 self._sock 上的 getsockopt，避开 close 顺序竞争）
+        # 停止语义：_stopped.set() 后**必须 drain 完队列剩余帧**再退出（而不是立即 break）。
+        # recvmsg 阻塞超时(1s)保证循环能及时看到 _stopped，队列中的在途帧（stop 前已进
+        # socket 缓冲、recv 线程尚未读走）在下一轮 recvmsg 全部读出后才退出——否则这些帧
+        # 随 socket close 被内核丢弃，pcap 少最后一批包（35 实测 61612 vs 61613 差 1-2 帧，
+        # 非内核丢包，是 stop 时队列未 drain 完）。
         try:
             while not self._stopped.is_set():
                 try:
@@ -225,6 +233,25 @@ class AFPacketCapture:
                 ts_ns = self._decode_ts_ns(ancdata)
                 frame = self._restore_vlan(data, ancdata)
                 self._write_packet(frame, ts_ns)
+            # 停止信号已置位：drain 完队列剩余帧（stop 前已进缓冲、尚未读走的在途帧），
+            # 全部落盘后再退出。超时则退出（避免 stop join 卡死），剩帧下次 stop 重试。
+            if self._stopped.is_set() and not self._exc:
+                try:
+                    self._sock.settimeout(1.0)
+                    while True:
+                        try:
+                            data, ancdata, _flags, _addr = self._sock.recvmsg(65535, 1024)
+                        except socket.timeout:
+                            break  # 队列已空
+                        except OSError:
+                            break  # 网卡不可用/已关闭
+                        if not data:
+                            break
+                        ts_ns = self._decode_ts_ns(ancdata)
+                        frame = self._restore_vlan(data, ancdata)
+                        self._write_packet(frame, ts_ns)
+                except Exception:
+                    pass
         except Exception as e:
             self._exc = e
             logger.exception(f"抓包线程异常 {self.eth} -> {self.path}")

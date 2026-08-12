@@ -74,15 +74,16 @@ def init_capture():
 
 
 def _ensure_sock_buf_limits():
-    """serve 启动时确保 net.core.rmem_max/wmem_max >= 8MB。
+    """serve 启动时确保 net.core.rmem_max/wmem_max >= 32MB。
 
     抓包在独立子进程（capture.py _capture_process_main），GIL 不被 boce worker
     抢（根治 v1.5.2 第 3 层丢包根因）。但子进程 recv 线程 drain 间隙的瞬时积压
-    仍靠 SO_RCVBUF 缓冲；rmem_max 默认仅 212992（208KB），IO 抖动下可能瞬时溢出。
-    serve 以 root 运行，写 /proc/sys 即时全局生效；随 systemd 每次启动重设，
-    等价持久，不碰 /etc。<8MB 才写，>=8MB 不动；失败只 warn 不阻断 serve。
+    仍靠 SO_RCVBUF 缓冲；capture.py 请求 32MB，rmem_max 必须 >= 32MB 才不被
+    内核截断（截断则突发并发流量下内核丢包）。serve 以 root 运行，写 /proc/sys
+    即时全局生效；随 systemd 每次启动重设，等价持久，不碰 /etc。<32MB 才写，
+    >=32MB 不动；失败只 warn 不阻断 serve。
     """
-    TARGET = 8 * 1024 * 1024
+    TARGET = 32 * 1024 * 1024
     for name in ("net/core/rmem_max", "net/core/wmem_max"):
         path = "/proc/sys/" + name
         try:

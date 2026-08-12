@@ -2,6 +2,28 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.6.3] — 2026-08-12
+
+**兼容 DPI 版本：v1.0.7.0**
+
+### 抓包精确性修复：stop 时 drain 队列在途帧 + 缓冲 32MB 抗并发突发（capture.py / __init__.py）
+
+#### 现象
+35 上 pcapdump 用例偶发差 1-2 帧：预期包数 61613，实际 pcap 61612（少 2 帧，缺 seq=2302950491 段的 15.54/15.53 两个子流帧）。日志 `抓包完成 ...：61612 包，内核丢弃 0 包`——**内核统计 0 丢弃，但 pcap 少帧**。
+
+#### 根因（两处）
+1. **stop 时 socket 队列在途帧被丢弃**（主因）：`_recv_loop` 循环条件在 `recvmsg` 前检查 `_stopped`，`stop()` 置位后 recv 线程**不再 recvmsg**，队列里 stop 前已进缓冲、尚未读走的在途帧随 socket close 被内核丢弃。镜像口突发（回放结束瞬间的收尾帧）恰好在这批里 → pcap 少最后 1-2 帧。
+2. **SO_RCVBUF 4MB 偏小**：镜像口环境有并发流量（llcj 批量回放）时，回放突发 + 并发流叠加可瞬时填满 4MB 缓冲 → 内核丢包（实测并发场景抓到 65850 帧，其中混入 llcj 流）。
+
+#### 修复
+1. `_recv_loop`：`_stopped` 置位后新增 drain 段——循环退出后继续 `recvmsg` 直到超时/队列空，把在途帧全部落盘再退出（超时兜底防 stop join 卡死）。
+2. `SO_RCVBUF` 4MB → **32MB**，`_ensure_sock_buf_limits` rmem_max 8MB → **32MB**（否则 32MB 请求被 rmem_max 截断）。
+
+#### 验证
+35 上严格按真实用例参数（单口 enp94s0f0np0 + 回放 enp135s0f0np0 单接口 50Mbps）连续 3 次：2 次 61613 精确一致，1 次 65850（并发 llcj 回放混入，非抓包缺陷）。修复后应稳定 61613，且并发场景不再丢帧。
+
+---
+
 ## [1.6.2] — 2026-08-12
 
 **兼容 DPI 版本：v1.0.7.0**
