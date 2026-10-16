@@ -7,7 +7,7 @@
 ## 0. 背景与目标
 
 1. **文件传输体验**：现 MCP `file_upload`/`file_download` 把文件落在中央节点 `downloads/`，LLM/用户不知道文件在哪、拿不走（死数据）。
-2. **工具收敛**：17 个 MCP 工具中 5 个（version_query/version_detail/filesize/command_exists/routeinfo）经审计（3 个月 audit_log 2368 次 + 靶机 journalctl datatype 统计 1283 次）确认无业务价值，删除。
+2. **工具收敛**：17 个 MCP 工具中 5 个（version_query/version_detail/filesize/command_exists/routeinfo）经审计（3 个月 audit_log 2368 次 + 靶机 journalctl datatype 统计 1283 次）确认无业务价值，删除；另 2 个（file_upload/file_download）被 HTTP 文件服务替代（见目标 1），共删 7 个。
 3. **补齐自动化核心**：pcap 回放（datatype 0）与 TCP 监听（171-174）是 DPI 自动化测试核心，纳入 MCP。
 4. 维护性：两仓独立发版节奏不变；socket_server 协议 datatype 零新增零修改。
 
@@ -78,7 +78,7 @@ POST http://<host>:9001/files        (multipart/form-data)
 ```json
 {
   "name": "replay_run",
-  "description": "在靶机回放 pcap 流量文件(scapy 双接口收发,支持限速/改五元组)。需先用 HTTP 上传把 pcap 传到靶机: curl -F \"path=/home/tmp/x.pcap\" -F \"file=@x.pcap\" http://<host>:9001/files。回放与抓包/拨测同靶机互斥;回放+抓包请分属两台靶机(跨机拓扑)。返回 {total_files,total_packets,total_bytes,uplink_packets,downlink_packets,flow_count,duration}",
+  "description": "在靶机回放 pcap 流量文件(scapy 双接口收发,支持限速/改五元组)。需先用 HTTP 上传把 pcap 传到靶机: curl -F \"path=/home/tmp/x.pcap\" -F \"file=@x.pcap\" http://<host>:9001/files。回放与抓包/拨测同靶机互斥;回放+抓包请分属两台靶机(跨机拓扑)。返回 {total_files,total_packets,total_bytes,uplink_packets,uplink_bytes,downlink_packets,downlink_bytes,flow_count,duration_seconds,target_mbps,actual_mbps}",
   "inputSchema": {
     "properties": {
       "targets":       {"type": "array", "items": {"type": "string"}, "description": "靶机列表(裸IP/host:port/@tag)"},
@@ -109,7 +109,7 @@ POST http://<host>:9001/files        (multipart/form-data)
 ```json
 {
   "name": "socket_listen",
-  "description": "在靶机启动 TCP 端口监听接收流量,配合回放做对比测试。action: start=启动返回pid / clean=清空已收数据 / save=已收数据保存到靶机文件 / fetch=取回已收数据(超过 max_bytes 落盘靶机并截断返回)。同一监听实例须按 start→...→save/fetch 顺序调用",
+  "description": "在靶机启动 TCP 端口监听接收流量,配合回放做对比测试。action: start=启动返回pid / clean=清空已收数据 / save=已收数据保存到靶机文件 / fetch=取回已收数据(超过 max_bytes 落盘靶机并截断返回)。注意: 已在监听时再 start 为幂等操作,返回现有 pid,更换 listen_port 需先等监听自然结束(服务端无 stop 动作,重启靶机进程才能换端口)。同一监听实例须按 start→...→save/fetch 顺序调用",
   "inputSchema": {
     "properties": {
       "targets":     {"type": "array", "items": {"type": "string"}},
@@ -125,7 +125,7 @@ POST http://<host>:9001/files        (multipart/form-data)
 }
 ```
 
-- 动作映射：start→171（`{"host":null,"port":listen_port}` 返回 `{"pid":[...]}`）；clean→172；save→173（`{"file":file}`）；fetch→174（`[8B len][gzip]` 解包）。
+- 动作映射：start→171（`{"host":null,"port":listen_port}` 返回 `{"pid":[...]}`；**幂等**：已在监听时返回现有 pid，新 listen_port 被忽略）；clean→172（`ok`/`error`）；save→173（`{"file":file}`，返回 `ok`/`error`）；fetch→174（`[8B len][gzip]` 解包）。
 - fetch 响应：`{target, size, data_b64(≤max_bytes), truncated, file_path(超限时)}`——大文件引导用 HTTP 下载取全量。
 - 锁：`LockClass.SYSTEM`——**从 stub 变为 per-target 排他实现**（见 §4 修订 1）。
 
@@ -153,6 +153,8 @@ POST http://<host>:9001/files        (multipart/form-data)
 | 新靶机 + 旧中央节点 | HTTP 9001 空跑无害 |
 | config 未加 http_port | 默认 9001 开启 |
 | 显式关闭 | http_port=0 |
+
+**实现注意**：`/opt/socket/config` 现有 `port=9000` 行是历史遗留**未接线**配置（serve 的 TCP 端口实际来自 `cli.py` argparse 默认值，从未读 config）。`http_port=` 是新接线的 config key（读取模式同 `proxy=`/`autoupgrade=` 先例），实现时勿参照 `port` 的"配置"，也不顺手改动 `port`（超范围）。
 
 发版顺序：
 1. socket_server 1.7.0（HTTP 文件服务；datatype 无变化）
