@@ -7,7 +7,7 @@
 ## 0. 背景与目标
 
 1. **文件传输体验**：现 MCP `file_upload`/`file_download` 把文件落在中央节点 `downloads/`，LLM/用户不知道文件在哪、拿不走（死数据）。
-2. **工具收敛**：17 个 MCP 工具中 5 个（version_query/version_detail/filesize/command_exists/routeinfo）经审计（3 个月 audit_log 2368 次 + 靶机 journalctl datatype 统计 1283 次）确认无业务价值，删除；另 2 个（file_upload/file_download）被 HTTP 文件服务替代（见目标 1），共删 7 个。
+2. **工具收敛**：17 个 MCP 工具中 5 个（version_query/version_detail/filesize/command_exists/routeinfo）确认无业务价值，删除；另 2 个（file_upload/file_download）被 HTTP 文件服务替代（见目标 1），共删 7 个。**删除证据**：靶机 journalctl 全量 datatype 统计（1283 次调用中这 5 个合计 ≤5 次，其中含测试流量）；注：读工具不经 MCP 审计（audit_log 只记写工具），"审计 0 次"仅对写工具是有效证据。
 3. **补齐自动化核心**：pcap 回放（datatype 0）与 TCP 监听（171-174）是 DPI 自动化测试核心，纳入 MCP。
 4. 维护性：两仓独立发版节奏不变；socket_server 协议 datatype 零新增零修改。
 
@@ -15,7 +15,7 @@
 
 ### 1.1 模块与启动
 
-- 新模块 `socket_server/http_file.py`，标准库 `http.server.ThreadingHTTPServer`，零新依赖。
+- 新模块 `socket_server/http_file.py`，标准库 `http.server.ThreadingHTTPServer`，零第三方依赖（stdlib pyc 带来 <100KB 二进制增量，见 §3）。
 - `serve` 启动序列：**先起 HTTP daemon 线程（:9001 双栈），再调 `start_tcp_server`（:9000，阻塞主线程）**——TCP 的 IPv6 serve_forever 永不返回，HTTP 必须在其之前就绪；HTTP 启动失败只告警，不影响 TCP 主服务。
 - **双栈监听**（与 `server.py` TCP 实现逐行同构）：IPv4 `('0.0.0.0', port)` + IPv6 `AF_INET6 + IPV6_V6ONLY=1` 绑 `('::', port)`；IPv6 起不来降级仅 IPv4 并告警。
 
@@ -28,7 +28,7 @@ http_port=9001
 ```
 
 - 默认 9001（config 无此行时开启）；`http_port=0` 显式关闭。
-- 端口被占：告警降级/放弃，不影响 TCP。
+- 端口被占：**放弃 HTTP 文件服务并告警**（无备用端口逻辑，区别于 IPv6 的"降级为仅 IPv4"），TCP 主服务不受影响。
 
 ### 1.3 接口定义（权威，MCP 描述同步）
 
@@ -104,6 +104,7 @@ POST http://<host>:9001/files        (multipart/form-data)
 
 - 锁：新增 `LockClass.REPLAY`，per-target 排他（与 CAPTURE/SHELL/BROWSER 互斥，机制复用 `_exclusive_holder`）。
 - 响应：PcapReplayer stats dict 直接 JSON 透传（datatype 0 现状）。
+- 类型防线注记：服务端 handlers 对参数 **kwargs 直传无类型校验（datatype 0 分支仅查必填键），`mbps:integer` 等类型约束完全靠 MCP 层 pydantic schema 兜底——schema 是唯一类型防线，不可省。
 - 不透出：`force_build_flow`/`enable_pcap_cache`/`verbose` 等调优参数（YAGNI）。
 
 ### 2.3 新增 socket_listen（datatype 171-174 编排）
@@ -118,7 +119,7 @@ POST http://<host>:9001/files        (multipart/form-data)
       "action":      {"type": "string", "enum": ["start", "clean", "save", "fetch"], "description": "start=启动 / clean=清空 / save=存文件 / fetch=取回"},
       "listen_port": {"type": "integer", "default": 30001, "description": "仅 start 用:监听端口"},
       "file":        {"type": "string", "description": "仅 save 用:保存到靶机的绝对路径"},
-      "max_bytes":   {"type": "integer", "default": 1048576, "description": "仅 fetch 用:返回内容上限(gzip 解压后明文字节数),超限截断并落盘靶机 /home/tmp/listen_<ts>.log"},
+      "max_bytes":   {"type": "integer", "default": 1048576, "description": "仅 fetch 用:返回内容上限(gzip 解压后明文字节数),超限截断并落盘靶机 /home/tmp/listen_<时间戳>.log"},
       "port":        {"type": "integer", "default": 9000},
       "description": {"type": "string", "description": "一句话说明本次调用的目的（将展示给用户），不超过 50 字"}
     },
@@ -128,7 +129,7 @@ POST http://<host>:9001/files        (multipart/form-data)
 ```
 
 - 动作映射：start→171（`{"host":null,"port":listen_port}` 返回 `{"pid":[...]}`；**幂等**：已在监听时返回现有 pid，新 listen_port 被忽略；**失败判定**：`pid` 为空列表时该 target 判 failed，reason 注明"监听进程未起来，检查端口占用"）；clean→172（`ok`/`error`，`error` 判 failed）；save→173（`{"file":file}`，返回 `ok`/`error`）；fetch→174（`[8B len][gzip]` 解包；**失败判定**：未启动监听时 174 返回 `{"error":"未启动监听"}` JSON 而非 gzip 流，socket_client 需先探测响应形态，`error` 判 failed）。
-- fetch 响应：`{target, size, data_b64(≤max_bytes), truncated, file_path(超限时)}`。**语义定死**：`max_bytes` 以 gzip 解压后明文字节数计（与 `size`/`data_b64` 解压后一致）；`size` = 全量明文字节数（非截断后），LLM 据此判断是否需要取全量。**超限落盘实现路径**：MCP 调 174 已拿到全量数据，超 `max_bytes` 时**再调一次 173（save）把数据存到靶机** `/home/tmp/listen_<ts>.log`（173 本就是在靶机侧写 `ss.data`），响应带 `file_path` + `truncated:true`，引导用 HTTP 下载取全量；未超限不产生额外往返。
+- fetch 响应：`{target, size, data_b64(≤max_bytes), truncated, file_path(超限时)}`。**语义定死**：`max_bytes` 以 gzip 解压后明文字节数计（与 `size`/`data_b64` 解压后一致）；`size` = 全量明文字节数（非截断后），LLM 据此判断是否需要取全量。**超限落盘实现路径**：MCP 调 174 已拿到全量数据，超 `max_bytes` 时**再调一次 173（save）把数据存到靶机** `/home/tmp/listen_<时间戳>.log`（173 本就是在靶机侧写 `ss.data`；**时间戳由 MCP 中央节点生成**，`time.strftime('%Y%m%d_%H%M%S')` 本地时间，拼完整路径后作为 `file` 参数传 173），响应带 `file_path` + `truncated:true`，引导用 HTTP 下载取全量；未超限不产生额外往返。
 - 锁：`LockClass.SYSTEM`——**从 stub 变为 per-target 排他实现**（见 §4 修订 1）。**持锁时长：逐动作短锁**（每次调用前 acquire、finally release）——与 CAPTURE 的跨调用长锁不同：监听四动作是离散操作，短锁足够防单次动作并发；跨调用状态由服务端单例 `ss` 天然保持（MCP 无状态），长锁反而有"LLM 忘了后续动作锁永不释放"的风险。代价：两个 LLM 会话交错对同一靶机 clean/fetch 可能读到意外数据——文档描述已写明"同一监听实例须按顺序调用"，属约定俗成。
 
 ### 2.4 保留工具描述同步（HTTP 用法写进描述）
@@ -153,6 +154,7 @@ POST http://<host>:9001/files        (multipart/form-data)
 | 打包 | spec `hiddenimports` 加 `socket_server.http_file`；增量 = http.server + email.parser 等标准库 pyc（<100KB 量级，16MB 二进制占比 <1%） |
 | 旧 MCP + 新靶机 | 无感（TCP 协议零改动） |
 | 新靶机 + 旧中央节点 | HTTP 9001 空跑无害 |
+| **新中央节点 + 旧靶机（未升级）** | ⚠️ LLM 按工具描述去 curl 9001 会连接拒绝。缓解：① 中央节点发版排在靶机自动升级基本铺开之后（发版顺序 §3.1→§3.2 已保证）；② 工具描述加一句"若 9001 拒绝连接，说明该靶机尚未升级到 1.7.0"引导 LLM 排查 |
 | config 未加 http_port | 默认 9001 开启 |
 | 显式关闭 | http_port=0 |
 
@@ -173,7 +175,7 @@ POST http://<host>:9001/files        (multipart/form-data)
 
 ### socket_server
 - 单元：multipart 解析（正常/缺字段/文件名异常/二进制含 boundary 串）、路径归一化（**含穿越用例**：`path=/home/tmp/../../etc/passwd` → realpath 归一化后行为断言）、400/404/500 分支、query UTF-8 解码、http_port=0 不启动。
-- 端到端（本机 serve）：curl 下载 sha256 比对；上传后 isfile+字节数核对；IPv6 `http://[::1]:9001` 全流程。
+- 端到端（本机 serve）：curl 下载 sha256 比对；上传后经 TCP datatype 7（isfile 请求）+ `os.path.getsize` 字节数核对（本机 serve 无 MCP，不走 MCP 工具）；IPv6 `http://[::1]:9001` 全流程。
 - `test_e2e.py` 加 HTTP 文件传输段（沿用逐步 check 风格）。
 
 ### mcp_socket_server
