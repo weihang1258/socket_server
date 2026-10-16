@@ -24,7 +24,7 @@
 
 ## Part A：socket_server 1.7.0（HTTP 文件服务）
 
-### Task A1: http_file.py 模块骨架 + 配置读取
+### Task 1: http_file.py 模块骨架 + 配置读取
 
 **Files:**
 - Create: `/opt/socket_server/socket_server/http_file.py`
@@ -132,7 +132,7 @@ git commit -m "feat: http_file 配置读取 http_port= (默认9001,0=关闭)"
 
 ---
 
-### Task A2: GET 下载 + POST 上传 handler
+### Task 2: GET 下载 + POST 上传 handler
 
 **Files:**
 - Modify: `/opt/socket_server/socket_server/http_file.py`（追加 FileHandler）
@@ -514,7 +514,7 @@ git commit -m "feat: http_file GET下载/POST multipart上传,realpath归一化+
 
 ---
 
-### Task A3: 双栈启动 + serve 接线
+### Task 3: 双栈启动 + serve 接线
 
 **Files:**
 - Modify: `/opt/socket_server/socket_server/http_file.py`（追加 start_http_file_server）
@@ -678,7 +678,7 @@ git commit -m "feat: http_file 双栈启动 + serve 接线(HTTP先于TCP)"
 
 ---
 
-### Task A4: 打包接线 + 文档同步
+### Task 4: 打包接线 + 文档同步
 
 **Files:**
 - Modify: `/opt/socket_server/packaging/socket_server.spec`（hiddenimports 加一行）
@@ -767,7 +767,7 @@ git commit -m "chore: 1.7.0 打包接线+文档同步(api-guide/mcp-integration 
 
 ---
 
-### Task A5: 真实靶机端到端验证（发版前）
+### Task 5: 真实靶机端到端验证（发版前）
 
 **Files:** 无代码改动；验证 + 修复发现的问题。
 
@@ -807,7 +807,7 @@ Expected: 均 OK。发现问题回 Task A1-A3 修复，重跑本任务。
 
 ---
 
-### Task A6: socket_server 1.7.0 发版（按 CLAUDE.md 标准流程）
+### Task 6: socket_server 1.7.0 发版（按 CLAUDE.md 标准流程）
 
 - [ ] **Step 1: 提交 + tag + push**
 
@@ -830,7 +830,7 @@ git push origin main && git tag -a v1.7.0 -m "1.7.0: HTTP 文件服务(:9001 双
 
 ## Part B：mcp_socket_server 0.2.0（工具收敛 17→12）
 
-### Task B1: locks.py SYSTEM 去 stub（per-target 排他）+ commands.py 注册 REPLAY
+### Task 7: locks.py SYSTEM 去 stub（per-target 排他）+ commands.py 注册 REPLAY
 
 **Files:**
 - Modify: `/opt/mcp_socket_server/src/mcp_socket_server/locks.py:118-125`（LockManager.acquire 的 SYSTEM 分支）
@@ -914,7 +914,7 @@ git commit -m "feat: SYSTEM 锁去 stub(per-target 排他) + 新增 REPLAY 锁�
 
 ---
 
-### Task B2: socket_client 新增 replay_run/socket_listen 方法，删 7 个废弃方法
+### Task 8: socket_client 新增 replay_run/socket_listen 方法，删 7 个废弃方法
 
 **Files:**
 - Modify: `/opt/mcp_socket_server/src/mcp_socket_server/socket_client.py`（加 2 方法；删 `version`/`routeinfo`/`command_exists`/`filesize`/`version_detail`/`file_upload`/`file_download`）
@@ -1110,7 +1110,7 @@ git commit -m "feat: socket_client 增 replay_run/socket_listen,删 7 个废弃�
 
 ---
 
-### Task B3: server.py 删 7 工具 + 改描述
+### Task 9: server.py 删 7 工具 + 改描述
 
 **Files:**
 - Modify: `/opt/mcp_socket_server/src/mcp_socket_server/server.py`
@@ -1198,7 +1198,7 @@ git commit -m "feat!: 删 7 工具(version_query/detail/filesize/command_exists/
 
 ---
 
-### Task B4: 新增 replay_run / socket_listen 工具
+### Task 10: 新增 replay_run / socket_listen 工具
 
 **Files:**
 - Modify: `/opt/mcp_socket_server/src/mcp_socket_server/server.py`
@@ -1345,7 +1345,7 @@ git commit -m "feat: 新增 replay_run(REPLAY锁)/socket_listen(SYSTEM短锁+fet
 
 ---
 
-### Task B5: 版本 0.2.0 + 全量回归 + 真实靶机端到端
+### Task 11: 版本 0.2.0 + 全量回归 + 真实靶机端到端
 
 **Files:**
 - Modify: `/opt/mcp_socket_server/pyproject.toml`（version 0.1.0 → 0.2.0）
