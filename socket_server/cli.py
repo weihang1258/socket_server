@@ -39,6 +39,17 @@ def cmd_serve(args):
         logger = logging.getLogger("socket_server")
         logger.warning(f"自动升级线程启动失败（不影响服务）: {e}")
 
+    # 启动 HTTP 文件服务(:9001,spec: docs/superpowers/specs/2026-10-16-http-file-transfer-mcp-convergence-design.md)
+    # 必须先于 start_tcp_server:TCP 主线程 serve_forever 阻塞永不返回
+    try:
+        from .http_file import read_http_port, start_http_file_server
+        http_port = read_http_port()
+        if http_port:
+            start_http_file_server(http_port)
+    except Exception as e:
+        logger = logging.getLogger("socket_server")
+        logger.warning(f"HTTP 文件服务启动失败（不影响 TCP 主服务）: {e}")
+
     # 启动 TCP 服务
     start_tcp_server(args.port, ServiceHandler)
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote
@@ -177,3 +178,46 @@ def start_http_file_server_for_test():
     t = threading.Thread(target=s.serve_forever, daemon=True)
     t.start()
     return s.server_address[1], (lambda: (s.shutdown(), s.server_close()))
+
+
+_servers = []  # 持有 ThreadingHTTPServer 引用,供测试与优雅关闭
+
+
+def start_http_file_server(port: int) -> None:
+    """双栈启动 HTTP 文件服务(非阻塞,daemon 线程),立即返回。
+
+    与 server.py 的 TCP 双栈实现逐行同构:IPv4 (0.0.0.0) + IPv6 ([::])
+    IPV6_V6ONLY=1;IPv6 起不来降级仅 IPv4;port=0 关闭;端口被占放弃并告警
+    (无备用端口逻辑),不影响 TCP 主服务。
+    """
+    if not port:
+        logger.info("http_port=0,HTTP 文件服务不启动")
+        return
+
+    class _V6(ThreadingHTTPServer):
+        address_family = socket.AF_INET6
+
+        def server_bind(self):
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            super().server_bind()
+
+    try:
+        server4 = ThreadingHTTPServer(("0.0.0.0", port), FileHandler)
+        server4.daemon_threads = True
+        _servers.append(server4)
+        threading.Thread(target=server4.serve_forever, daemon=True,
+                         name="http-file-v4").start()
+        logger.info(f"HTTP 文件服务监听 0.0.0.0:{port} (IPv4)")
+    except OSError as e:
+        logger.warning(f"HTTP 文件服务 IPv4 监听失败: {e},HTTP 文件服务不可用")
+        return
+
+    try:
+        server6 = _V6(("::", port), FileHandler)
+        server6.daemon_threads = True
+        _servers.append(server6)
+        threading.Thread(target=server6.serve_forever, daemon=True,
+                         name="http-file-v6").start()
+        logger.info(f"HTTP 文件服务监听 [::]:{port} (IPv6)")
+    except OSError as e:
+        logger.warning(f"HTTP 文件服务 IPv6 监听失败: {e},降级为仅 IPv4 模式")

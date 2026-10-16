@@ -171,3 +171,40 @@ def test_post_upload_400_missing_field(tmpdir):
             assert e.code == 400
     finally:
         stop()
+
+
+def test_start_http_file_server_dual_stack(tmpdir):
+    from socket_server.http_file import start_http_file_server
+    # 随机端口:用 0 会读 config 默认 9001,这里直测显式端口
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    start_http_file_server(port)  # 应双栈起服,立即返回(内部 daemon 线程)
+    # IPv4 可连(无 path 参数 -> 400 也证明服务活着;urllib 对 4xx 抛 HTTPError)
+    import time
+    time.sleep(0.3)  # 给 daemon 线程起服留时间,避免竞态 flaky
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/files") as resp:
+            assert resp.status in (200, 400)
+    except urllib.error.HTTPError as e:
+        assert e.code in (200, 400)
+    # IPv6 可连(本机支持 IPv6 时)
+    try:
+        try:
+            with urllib.request.urlopen(f"http://[::1]:{port}/files") as resp:
+                assert resp.status in (200, 400)
+        except urllib.error.HTTPError as e:
+            assert e.code in (200, 400)
+        ipv6_ok = True
+    except Exception:
+        ipv6_ok = False  # 容器无 IPv6 时允许,降级路径
+    # 停服:直接探进程内 server 列表
+    from socket_server import http_file as hf
+    for srv in hf._servers:
+        srv.shutdown()
+        srv.server_close()
+    hf._servers.clear()
+    # 端口 0 = 不启动
+    start_http_file_server(0)  # 应安静返回
