@@ -2,6 +2,18 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.7.0] - 2026-10-16
+
+兼容 DPI/MCP 版本：mcp_socket_server 0.2.0
+
+### 新增
+- HTTP 文件服务（`http_port=9001`，config 可配，0=关闭）：GET `/files?path=` 下载、POST `/files` multipart 上传，双栈监听，TCP 协议零改动。供 LLM 直连靶机上传/下载文件（MCP file_upload/download 工具由 0.2.0 起移除）。
+
+### 依赖
+- 零第三方新依赖（http.server 标准库；二进制增量 <100KB）
+
+---
+
 ## [1.6.3] — 2026-08-12
 
 **兼容 DPI 版本：v1.0.7.0**

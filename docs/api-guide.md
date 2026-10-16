@@ -83,3 +83,18 @@
 5. **修改MTU(10)** 需sudo权限，执行后等待5秒生效
 6. **tcpdump抓包(5/6)** 需系统安装tcpdump命令
 7. **datatype 14** 仅返回版本号字符串，**datatype 19** 返回完整版本信息含升级状态
+
+## HTTP 文件服务（1.7.0+）
+
+与 TCP :9000 并行的旁路 HTTP 服务，默认 :9001（`/opt/socket/config` 的 `http_port=` 可改，0=关闭）。
+
+| 方法 | 路径 | 参数 | 成功 | 失败 |
+|------|------|------|------|------|
+| GET | `/files?path=<绝对路径>` | query: path | 200 文件流（octet-stream, attachment） | 400 缺 path / 404 不存在 |
+| POST | `/files` | multipart: `path`(文本) + `file`(二进制) | 200 `{"ok":true,"path":...,"size":N}` | 400 缺字段 / 500 写盘失败 |
+
+curl 示例：
+```bash
+curl -o out.pcap "http://<host>:9001/files?path=/home/tmp/tmp.pcap"
+curl -F "path=/home/tmp/deploy.zip" -F "file=@deploy.zip" http://<host>:9001/files
+```

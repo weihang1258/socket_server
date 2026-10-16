@@ -42,6 +42,7 @@ a = Analysis(
         'socket_server.upgrader',
         'socket_server.supervisor',
         'socket_server.autoupgrade',
+        'socket_server.http_file',
         'socket_server.release_notes',
         'scapy.all',
         'scapy.arch.linux',

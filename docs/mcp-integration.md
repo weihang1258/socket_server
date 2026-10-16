@@ -46,6 +46,8 @@ socket_server 作为执行单元，通过独立的 MCP server 暴露给 LLM 平�
 
 **不要把 MCP 代码塞进 socket_server 仓库。** 部署位置、依赖栈、发版节奏、安全模型都不同，物理隔离。
 
+> 1.7.0 起 socket_server 内置 HTTP 文件服务（:9001），MCP 层的 file_upload/file_download 工具已在 mcp_socket_server 0.2.0 移除，LLM 经工具描述中的 curl 示例直连靶机 HTTP 传输文件。
+
 ## 3. 共享契约：协议定义
 
 两个项目唯一的耦合点是 **socket_server 的 TCP 协议**（datatype 编号 + 参数 JSON schema）。权威定义在 socket_server 仓库，MCP server 据此生成工具 schema。
@@ -63,7 +65,7 @@ socket_server 作为执行单元，通过独立的 MCP server 暴露给 LLM 平�
 |----------|------|------|---------|------|
 | 0 | scapy 发包 | 写 | replay | 同靶机排他 |
 | 1 | 执行命令 | 写 | shell | 同靶机排他，危险需确认 |
-| 3 | 文件下载 | 写 | file_io | 按 path |
+| 3 | 文件下载 | 写 | file_io | 按 path（MCP 工具已删（0.2.0），改用 HTTP :9001） |
 | 4 | 路由信息 | 读 | None | 自由并发 |
 | 5 | tcpdump 开始抓包 | 写 | capture | 按 (iface,path) 排他，不同组合可并发 |
 | 6 | tcpdump 停止抓包 | 写 | capture | 释放对应 path 锁 |
@@ -146,7 +148,7 @@ LLM 不记 IP，按标签选机（`@机房A`）。`list_targets` 工具查询在
 写类（加确认后开放）：
 - `capture_start(targets, iface, path, filter)` — datatype 5
 - `capture_stop(targets, path)` — datatype 6
-- `file_upload(targets, remote_path, content)` / `file_download(targets, path)` — datatype 22/3
+- `file_upload(targets, remote_path, content)` / `file_download(targets, path)` — datatype 22/3（MCP 工具已删（0.2.0），改用 HTTP :9001）
 - `cmd_exec(targets, command, whitelist)` — datatype 1，命令白名单
 - `boce_run(targets, url, ...)` — datatype 131
 - `version_switch(targets, version)` — 危险，二次确认
