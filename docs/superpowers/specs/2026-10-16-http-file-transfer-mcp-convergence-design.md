@@ -16,7 +16,7 @@
 ### 1.1 模块与启动
 
 - 新模块 `socket_server/http_file.py`，标准库 `http.server.ThreadingHTTPServer`，零新依赖。
-- `serve` 启动序列：TCP :9000 双栈（现有）→ HTTP :9001 双栈（新，daemon 线程）→ 其余现有逻辑。HTTP 启动失败只告警，不影响 TCP 主服务。
+- `serve` 启动序列：**先起 HTTP daemon 线程（:9001 双栈），再调 `start_tcp_server`（:9000，阻塞主线程）**——TCP 的 IPv6 serve_forever 永不返回，HTTP 必须在其之前就绪；HTTP 启动失败只告警，不影响 TCP 主服务。
 - **双栈监听**（与 `server.py` TCP 实现逐行同构）：IPv4 `('0.0.0.0', port)` + IPv6 `AF_INET6 + IPV6_V6ONLY=1` 绑 `('::', port)`；IPv6 起不来降级仅 IPv4 并告警。
 
 ### 1.2 配置
@@ -116,7 +116,7 @@ POST http://<host>:9001/files        (multipart/form-data)
       "action":      {"type": "string", "enum": ["start", "clean", "save", "fetch"], "description": "start=启动 / clean=清空 / save=存文件 / fetch=取回"},
       "listen_port": {"type": "integer", "default": 30001, "description": "仅 start 用:监听端口"},
       "file":        {"type": "string", "description": "仅 save 用:保存到靶机的绝对路径"},
-      "max_bytes":   {"type": "integer", "default": 1048576, "description": "仅 fetch 用:返回内容上限字节,超限截断并落盘靶机 /home/tmp/listen_<ts>.log"},
+      "max_bytes":   {"type": "integer", "default": 1048576, "description": "仅 fetch 用:返回内容上限(gzip 解压后明文字节数),超限截断并落盘靶机 /home/tmp/listen_<ts>.log"},
       "port":        {"type": "integer", "default": 9000},
       "description": {"type": "string", "description": "一句话说明本次调用的目的（将展示给用户），不超过 50 字"}
     },
@@ -126,7 +126,7 @@ POST http://<host>:9001/files        (multipart/form-data)
 ```
 
 - 动作映射：start→171（`{"host":null,"port":listen_port}` 返回 `{"pid":[...]}`；**幂等**：已在监听时返回现有 pid，新 listen_port 被忽略）；clean→172（`ok`/`error`）；save→173（`{"file":file}`，返回 `ok`/`error`）；fetch→174（`[8B len][gzip]` 解包）。
-- fetch 响应：`{target, size, data_b64(≤max_bytes), truncated, file_path(超限时)}`。**超限落盘实现路径**：MCP 调 174 已拿到全量数据，超 `max_bytes` 时**再调一次 173（save）把数据存到靶机** `/home/tmp/listen_<ts>.log`（173 本就是在靶机侧写 `ss.data`），响应带 `file_path` + `truncated:true`，引导用 HTTP 下载取全量；未超限不产生额外往返。
+- fetch 响应：`{target, size, data_b64(≤max_bytes), truncated, file_path(超限时)}`。**语义定死**：`max_bytes` 以 gzip 解压后明文字节数计（与 `size`/`data_b64` 解压后一致）；`size` = 全量明文字节数（非截断后），LLM 据此判断是否需要取全量。**超限落盘实现路径**：MCP 调 174 已拿到全量数据，超 `max_bytes` 时**再调一次 173（save）把数据存到靶机** `/home/tmp/listen_<ts>.log`（173 本就是在靶机侧写 `ss.data`），响应带 `file_path` + `truncated:true`，引导用 HTTP 下载取全量；未超限不产生额外往返。
 - 锁：`LockClass.SYSTEM`——**从 stub 变为 per-target 排他实现**（见 §4 修订 1）。
 
 ### 2.4 保留工具描述同步（HTTP 用法写进描述）
