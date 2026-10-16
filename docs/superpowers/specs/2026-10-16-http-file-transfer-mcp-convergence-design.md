@@ -125,9 +125,9 @@ POST http://<host>:9001/files        (multipart/form-data)
 }
 ```
 
-- 动作映射：start→171（`{"host":null,"port":listen_port}` 返回 `{"pid":[...]}`；**幂等**：已在监听时返回现有 pid，新 listen_port 被忽略）；clean→172（`ok`/`error`）；save→173（`{"file":file}`，返回 `ok`/`error`）；fetch→174（`[8B len][gzip]` 解包）。
+- 动作映射：start→171（`{"host":null,"port":listen_port}` 返回 `{"pid":[...]}`；**幂等**：已在监听时返回现有 pid，新 listen_port 被忽略；**失败判定**：`pid` 为空列表时该 target 判 failed，reason 注明"监听进程未起来，检查端口占用"）；clean→172（`ok`/`error`，`error` 判 failed）；save→173（`{"file":file}`，返回 `ok`/`error`）；fetch→174（`[8B len][gzip]` 解包）。
 - fetch 响应：`{target, size, data_b64(≤max_bytes), truncated, file_path(超限时)}`。**语义定死**：`max_bytes` 以 gzip 解压后明文字节数计（与 `size`/`data_b64` 解压后一致）；`size` = 全量明文字节数（非截断后），LLM 据此判断是否需要取全量。**超限落盘实现路径**：MCP 调 174 已拿到全量数据，超 `max_bytes` 时**再调一次 173（save）把数据存到靶机** `/home/tmp/listen_<ts>.log`（173 本就是在靶机侧写 `ss.data`），响应带 `file_path` + `truncated:true`，引导用 HTTP 下载取全量；未超限不产生额外往返。
-- 锁：`LockClass.SYSTEM`——**从 stub 变为 per-target 排他实现**（见 §4 修订 1）。
+- 锁：`LockClass.SYSTEM`——**从 stub 变为 per-target 排他实现**（见 §4 修订 1）。**持锁时长：逐动作短锁**（每次调用前 acquire、finally release）——与 CAPTURE 的跨调用长锁不同：监听四动作是离散操作，短锁足够防单次动作并发；跨调用状态由服务端单例 `ss` 天然保持（MCP 无状态），长锁反而有"LLM 忘了后续动作锁永不释放"的风险。代价：两个 LLM 会话交错对同一靶机 clean/fetch 可能读到意外数据——文档描述已写明"同一监听实例须按顺序调用"，属约定俗成。
 
 ### 2.4 保留工具描述同步（HTTP 用法写进描述）
 
@@ -176,7 +176,8 @@ POST http://<host>:9001/files        (multipart/form-data)
 
 ### mcp_socket_server
 - 删 7 工具的测试同步删；`replay_run`/`socket_listen` mock 测试（mock_socket_server 补 datatype 0/171-174 handler）。
-- locks.py SYSTEM per-target 排他 3 测试（获取/互斥/释放）。
+- locks.py SYSTEM per-target 排他 3 测试（获取/互斥/释放）；**REPLAY×CAPTURE/SHELL/BROWSER 互斥测试**（新锁类与既有锁类的交互）。
+- **socket_listen 编排链路测试**：start 空 pid 判 failed；fetch 超限二次调 173 落盘并返回 `truncated+file_path`。
 - 全量 pytest；真实靶机端到端：replay_run 回放真实小 pcap；socket_listen start→fetch 链路；ListTools 校验 12 工具 schema（含 description）。
 
 ## 6. 明确不做（YAGNI）
