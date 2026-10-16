@@ -59,7 +59,7 @@ POST http://<host>:9001/files        (multipart/form-data)
 - firewalld：现有靶机 9000 可达即内网无阻拦；文档注明"开 firewalld 的靶机需放行 9001"。
 - HTTP handler 不接入 TCP client tracking（不影响 upgrade idle 判定；autoupgrade 30min 门槛兜底）。
 
-## 2. mcp_socket_server：工具收敛 17 → 14（0.2.0）
+## 2. mcp_socket_server：工具收敛 17 → 12（0.2.0）
 
 ### 2.1 删除 7 个工具（连 socket_client 方法 / commands.py 注册 / 测试一起删）
 
@@ -126,7 +126,7 @@ POST http://<host>:9001/files        (multipart/form-data)
 ```
 
 - 动作映射：start→171（`{"host":null,"port":listen_port}` 返回 `{"pid":[...]}`；**幂等**：已在监听时返回现有 pid，新 listen_port 被忽略）；clean→172（`ok`/`error`）；save→173（`{"file":file}`，返回 `ok`/`error`）；fetch→174（`[8B len][gzip]` 解包）。
-- fetch 响应：`{target, size, data_b64(≤max_bytes), truncated, file_path(超限时)}`——大文件引导用 HTTP 下载取全量。
+- fetch 响应：`{target, size, data_b64(≤max_bytes), truncated, file_path(超限时)}`。**超限落盘实现路径**：MCP 调 174 已拿到全量数据，超 `max_bytes` 时**再调一次 173（save）把数据存到靶机** `/home/tmp/listen_<ts>.log`（173 本就是在靶机侧写 `ss.data`），响应带 `file_path` + `truncated:true`，引导用 HTTP 下载取全量；未超限不产生额外往返。
 - 锁：`LockClass.SYSTEM`——**从 stub 变为 per-target 排他实现**（见 §4 修订 1）。
 
 ### 2.4 保留工具描述同步（HTTP 用法写进描述）
@@ -136,7 +136,7 @@ POST http://<host>:9001/files        (multipart/form-data)
 - `replay_run`：附"回放前先用 HTTP 上传 pcap"提示（§2.2 已含）。
 - schema 全量规范：业务工具统一 `targets` + `port`(默认 9000) + 可选 `description`；注册表工具（list/add/remove_target）不含 targets。
 
-### 2.5 最终工具清单（14 个）
+### 2.5 最终工具清单（12 个）
 
 注册表 3：`list_targets` / `add_target` / `remove_target`
 读支撑 3：`isfile` / `isdir` / `pcap_flow_extract`
@@ -165,7 +165,7 @@ POST http://<host>:9001/files        (multipart/form-data)
 
 1. **SYSTEM 锁 stub 缺口**：`locks.py:122` 现对 SYSTEM 直接 raise。修订：实现为 per-target 排他（复用 `_exclusive_holder`，去 stub + 3 测试）。不做全局排他（一台监听锁死所有靶机过度设计）。
 2. **REPLAY×CAPTURE 同机互斥**：维持互斥不放松；"回放+抓包"跨机拓扑写进 replay_run 描述（真实业务即跨机）。
-3. **fetch 体量风险**：加 `max_bytes`（默认 1MB）截断 + 落盘靶机 + `truncated` 标注，防大监听数据撑爆 MCP 响应。
+3. **fetch 体量风险**：加 `max_bytes`（默认 1MB）截断 + 落盘靶机 + `truncated` 标注，防大监听数据撑爆 MCP 响应。落盘实现：超限时 MCP 复用 173（save）在靶机侧写 `ss.data`，响应带 `file_path`。
 
 ## 5. 测试计划
 
@@ -177,7 +177,7 @@ POST http://<host>:9001/files        (multipart/form-data)
 ### mcp_socket_server
 - 删 7 工具的测试同步删；`replay_run`/`socket_listen` mock 测试（mock_socket_server 补 datatype 0/171-174 handler）。
 - locks.py SYSTEM per-target 排他 3 测试（获取/互斥/释放）。
-- 全量 pytest；真实靶机端到端：replay_run 回放真实小 pcap；socket_listen start→fetch 链路；ListTools 校验 14 工具 schema（含 description）。
+- 全量 pytest；真实靶机端到端：replay_run 回放真实小 pcap；socket_listen start→fetch 链路；ListTools 校验 12 工具 schema（含 description）。
 
 ## 6. 明确不做（YAGNI）
 
