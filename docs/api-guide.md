@@ -98,3 +98,5 @@ curl 示例：
 curl -o out.pcap "http://<host>:9001/files?path=/home/tmp/tmp.pcap"
 curl -F "path=/home/tmp/deploy.zip" -F "file=@deploy.zip" http://<host>:9001/files
 ```
+
+注意：开启了 firewalld 的靶机需放行 9001 端口（`firewall-cmd --add-port=9001/tcp --permanent && firewall-cmd --reload`）；内网默认无 firewalld 阻拦（与 TCP 9000 同级）。

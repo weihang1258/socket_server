@@ -140,16 +140,16 @@ LLM 不记 IP，按标签选机（`@机房A`）。`list_targets` 工具查询在
 
 只读类（先跑通链路）：
 - `list_targets` — 列在线靶机 + 标签
-- `version_query(targets)` — 查版本（datatype 14）
 - `isfile(targets, path)` / `isdir(targets, path)` — 文件/目录存在
-- `routeinfo(targets)` — 路由信息
-- `command_exists(targets, cmd)` — 命令是否存在
+- （version_query/routeinfo/command_exists 已于 0.2.0 删除：查版本用 `socket_server current` CLI，其余 cmd_exec `which`/`ip route` 替代）
 
 写类（加确认后开放）：
 - `capture_start(targets, iface, path, filter)` — datatype 5
 - `capture_stop(targets, path)` — datatype 6
-- `file_upload(targets, remote_path, content)` / `file_download(targets, path)` — datatype 22/3（MCP 工具已删（0.2.0），改用 HTTP :9001）
+- `file_upload` / `file_download` — MCP 工具已删（0.2.0），改用 HTTP :9001（详见 api-guide.md「HTTP 文件服务」）
 - `cmd_exec(targets, command, whitelist)` — datatype 1，命令白名单
+- `replay_run(targets, pcaps, uplink_iface, downlink_iface, ...)` — datatype 0 pcap 回放（0.2.0 新增）
+- `socket_listen(targets, action, ...)` — datatype 171-174 监听编排（0.2.0 新增）
 - `boce_run(targets, url, ...)` — datatype 131
 - `version_switch(targets, version)` — 危险，二次确认
 - `firewall_disable(targets)` — 危险，二次确认
