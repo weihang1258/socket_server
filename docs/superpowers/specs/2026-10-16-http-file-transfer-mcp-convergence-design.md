@@ -58,7 +58,8 @@ POST http://<host>:9001/files        (multipart/form-data)
 - multipart 解析用标准库（`email.parser` 或手切 boundary），必须正确处理二进制内容中含 boundary 串的对抗用例。
 - 日志复用现有 logging：每次上传/下载记 path、字节数、来源 IP。
 - firewalld：现有靶机 9000 可达即内网无阻拦；文档注明"开 firewalld 的靶机需放行 9001"。
-- HTTP handler 不接入 TCP client tracking（不影响 upgrade idle 判定；autoupgrade 30min 门槛兜底）。
+- HTTP handler 不接入 TCP client tracking（不影响 upgrade idle 判定；autoupgrade.py:21 `IDLE_THRESHOLD = 1800` 即 30 分钟门槛兜底，已核实）。
+- 3.8 兼容性已核实：`ThreadingHTTPServer` 在 Python 3.8.10 可导入（打包环境同版本）。
 
 ## 2. mcp_socket_server：工具收敛 17 → 12（0.2.0）
 
@@ -66,11 +67,11 @@ POST http://<host>:9001/files        (multipart/form-data)
 
 | 工具 | 删除依据 |
 |---|---|
-| version_query | 审计 0 次（靶机侧 3 次含测试）；CLI `socket_server current` 覆盖 |
+| version_query | 审计 0 次（靶机侧 3 次含测试）；CLI `socket_server current` 覆盖（cli.py:70 `cmd_current` 已核实存在） |
 | version_detail | 审计 0 次；release notes 给人不给 LLM |
 | filesize | 审计 0 次；`cmd_exec` `stat -c %s` 替代 |
 | command_exists | 审计 0 次；`cmd_exec` `which` 替代 |
-| routeinfo | 审计 0 次；capture_start 缺省 iface 的 routeinfo 逻辑在**服务端内部**，删 MCP 工具无影响 |
+| routeinfo | 审计 0 次；capture_start 缺省 iface 的 routeinfo 逻辑在**服务端内部**（capture.py:489-494 `tcpdump_start` 的 `eth=None` 分支直接调服务端 `routeinfo()`，与 MCP 工具无关），删 MCP 工具无影响 |
 | file_upload | 被 HTTP multipart 上传替代（§1.3） |
 | file_download | 被 HTTP GET 下载替代；download_dir 配置不生效 bug 随代码删除消失 |
 
@@ -149,7 +150,7 @@ POST http://<host>:9001/files        (multipart/form-data)
 
 | 项 | 说明 |
 |---|---|
-| 打包 | spec `hiddenimports` 加 `socket_server.http_file`；体积增量 ≈0 |
+| 打包 | spec `hiddenimports` 加 `socket_server.http_file`；增量 = http.server + email.parser 等标准库 pyc（<100KB 量级，16MB 二进制占比 <1%） |
 | 旧 MCP + 新靶机 | 无感（TCP 协议零改动） |
 | 新靶机 + 旧中央节点 | HTTP 9001 空跑无害 |
 | config 未加 http_port | 默认 9001 开启 |
