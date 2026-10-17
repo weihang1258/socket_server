@@ -76,6 +76,7 @@ socket_server 作为执行单元，通过独立的 MCP server 暴露给 LLM 平�
 | 18 | 命令是否存在 | 读 | None | 自由并发 |
 | 131 | 拨测（需 chromium） | 写 | browser | 同靶机排他 |
 | 171-174 | 抓包/发包相关 | 写 | capture/replay | 见上 |
+| 175 | socket监听-停止 | 写 | capture/replay（同 171-174） | 同靶机排他 |
 | 200 | （见 handlers.py） | - | - | - |
 | ~~121/122/123~~ | ~~scapy 抓包~~ | **弃用** | - | 勿暴露 |
 

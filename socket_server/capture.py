@@ -96,7 +96,7 @@ class AFPacketCapture:
         # 'hw_ts'  -> SO_TIMESTAMPING 硬件 RX（网卡 PHC，亚纳秒，mlx5/ixgbe 物理网卡支持）
         # 'sw_ts'  -> SO_TIMESTAMPING 软中断 RX（纳秒，等同 SO_TIMESTAMPNS，virtio 等）
         # 'ns_ts'  -> SO_TIMESTAMPNS（纳秒，老内核/驱动不支持 SO_TIMESTAMPING 的兜底）
-        # 'userspace' -> time.monotonic_ns() 在 recvmsg 返回时取（微秒级，全失败的兜底）
+        # 'userspace' -> time.time_ns() 墙钟在 recvmsg 返回时取（微秒级，全失败的兜底）
         self._ts_mode = 'userspace'
         # hw_ts 模式下若 cmsg ts[0] 全零（驱动/内核未填 PHC），退化软中断 ts[1]；
         # 首次退化 warn 一次，让 35 mlx5 这类声称支持 HW 的网卡能一眼看出 HW 是否真生效（不静默退化）。
@@ -122,7 +122,7 @@ class AFPacketCapture:
         #   L1 sw_ts：L0 setsockopt 失败（ENOPROTOOPT）-> 退 SO_TIMESTAMPING 仅 RX_SOFTWARE
         #             -> cmsg ts[1]（等同 SO_TIMESTAMPNS）
         #   L2 ns_ts：L1 也失败 -> SO_TIMESTAMPNS（老内核 2.6.x，极罕见）
-        #   L3 userspace：L2 也失败 -> recvmsg 返回时 time.monotonic_ns()（精度最低，兜底）
+        #   L3 userspace：L2 也失败 -> recvmsg 返回时 time.time_ns() 墙钟（精度最低，兜底）
         ts_flags = SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RX_SOFTWARE | SOF_TIMESTAMPING_RAW_HARDWARE
         try:
             s.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPING, ts_flags)

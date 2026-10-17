@@ -326,7 +326,7 @@ def do(datatype, data: bytes, **kwargs):
             logger.info("数据清理完成")
         else:
             logger.info("请先启动监听")
-            return b"error"
+            return json.dumps({"error": "未启动监听"}, ensure_ascii=False).encode("utf-8")
         return b"ok"
 
     # socket监听-保存数据
@@ -338,7 +338,7 @@ def do(datatype, data: bytes, **kwargs):
             logger.info(f"数据保存完成：{data['file']}")
         else:
             logger.info("请先启动监听")
-            return b"error"
+            return json.dumps({"error": "未启动监听"}, ensure_ascii=False).encode("utf-8")
         return b"ok"
 
     # socket监听-传输数据
@@ -386,7 +386,7 @@ def do(datatype, data: bytes, **kwargs):
         if stopped:
             logger.info("socket监听已停止")
             return b"ok"
-        return json.dumps({"error": "停止监听失败，端口仍被占用"}).encode("utf-8")
+        return json.dumps({"error": "停止监听失败，端口仍被占用"}, ensure_ascii=False).encode("utf-8")
 
     else:
         pass

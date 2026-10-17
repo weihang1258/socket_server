@@ -58,6 +58,7 @@
 | **172** | socket监听-清理数据 | 无 | 纯文本 | `ok` 或 `error` |
 | **173** | socket监听-保存数据 | `{"file":"/tmp/data.log"}` | 纯文本 | `ok` 或 `error` |
 | **174** | socket监听-传输数据 | 无 | `[8B长度 Q][gzip(JSON)]` | gzip压缩的监听数据 |
+| **175** | socket监听-停止 | 无 | 纯文本 | `ok` 或 `{"error":...}` |
 | **200** | 提取pcap五元组流 | `{"dir":"/tmp/pcaps"}` | `[4B长度 i][JSON]` | `[{"src_ip":"1.2.3.4","src_port":1234,"dst_ip":"5.6.7.8","dst_port":80,"proto":6},...]` |
 
 ---
