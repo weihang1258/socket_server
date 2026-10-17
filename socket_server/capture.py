@@ -101,6 +101,10 @@ class AFPacketCapture:
         # hw_ts 模式下若 cmsg ts[0] 全零（驱动/内核未填 PHC），退化软中断 ts[1]；
         # 首次退化 warn 一次，让 35 mlx5 这类声称支持 HW 的网卡能一眼看出 HW 是否真生效（不静默退化）。
         self._hw_degraded_warned = False
+        # _decode_ts_ns 墙钟回退分支的 once-only 日志节流：fallback 在收包热路径
+        # per-packet 触发，高流量下逐包 warning 会刷屏+拖慢收包；只告警一次，
+        # 行为（每次 return time.time_ns()）不受影响。
+        self._ts_fallback_warned = False
 
     def _open(self):
         # proto=0 创建：packet_create（af_packet.c:3393）仅在 proto!=0 时 __register_prot_hook
@@ -270,14 +274,14 @@ class AFPacketCapture:
             logger.exception(f"抓包线程异常 {self.eth} -> {self.path}")
 
     def _decode_ts_ns(self, ancdata):
-        """据 self._ts_mode 从 ancdata 解码纳秒时间戳，回退到 time.monotonic_ns()。
+        """据 self._ts_mode 从 ancdata 解码纳秒时间戳，回退到 time.time_ns()。
 
         - 'hw_ts'/'sw_ts'：取 SCM_TIMESTAMPING cmsg（struct[3] timespec，ts[0]HW ts[1]SW ts[2]unused）。
           hw_ts 模式下 ts[0] 非零用硬件（亚纳秒 PHC），ts[0]==0 退 ts[1]（软中断纳秒）--由 cmsg 内容
           自适应，不依赖预探测硬件支持（驱动/内核不给 HW 就自动降级，与 setsockopt 时探测解耦）。
           sw_ts 模式下直接用 ts[1]。
         - 'ns_ts'：取 SO_TIMESTAMPNS cmsg（单 timespec）。
-        - 'userspace'：cmsg 无时间戳，调用点用 time.monotonic_ns()（_recv_loop 已包此分支）。
+        - 'userspace'：cmsg 无时间戳，回退墙钟 time.time_ns()（_recv_loop 已包此分支）。
         timespec 用 @ll 解（time_t + long，按平台 long 宽度对齐，与 SO_TIMESTAMPNS 同）。
         """
         if self._ts_mode in ('hw_ts', 'sw_ts'):
@@ -305,8 +309,14 @@ class AFPacketCapture:
                 if cmsg_level == socket.SOL_SOCKET and cmsg_type == SO_TIMESTAMPNS:
                     tv_sec, tv_nsec = struct.unpack("@ll", cmsg_data)
                     return tv_sec * 1_000_000_000 + tv_nsec
-        # userspace 模式 / hw_ts|sw_ts 但 cmsg 缺失或 ts 全零 -> 调用点取单调纳秒
-        return time.monotonic_ns()
+        # userspace 模式 / hw_ts|sw_ts 但 cmsg 缺失或 ts 全零 -> 回退墙钟（B05：
+        # monotonic 是开机秒数，按 Unix 纪元解释落盘=1970）。NTP step 窗口内保序
+        # 不保证（kernel 时间戳同受影响，既有共性边界）；排序由 _sort_pcap_by_timestamp 兜底。
+        # 高流量下此分支 per-packet 触发，日志 once-only（只节流日志不节流行为）。
+        if not self._ts_fallback_warned:
+            logger.warning(f"cmsg 时间戳缺失，回退墙钟 time_ns：{self.eth} -> {self.path}")
+            self._ts_fallback_warned = True
+        return time.time_ns()
 
     def _restore_vlan(self, data, ancdata):
         """若内核 auxdata 标记帧带 VLAN，把被剥离的 802.1Q 标签插回 offset 12，还原在线帧。

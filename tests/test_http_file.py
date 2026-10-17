@@ -37,6 +37,14 @@ def test_parse_multipart_basic():
     assert content == b"\x00\x01\x02DATA"
 
 
+def test_parse_multipart_crlf_tail_variants():
+    # B05 验收:内容尾 CRLF 各形态全字节保真(修复前:尾1条/尾2条各丢1条)
+    for label, content in [("no-tail", b"abc"), ("tail-1", b"abc\r\n"), ("tail-2", b"abc\r\n\r\n")]:
+        body = _multipart_body("/tmp/t", "t.bin", content, b"B")
+        path, got = parse_multipart("multipart/form-data; boundary=B", body)
+        assert got == content, f"{label}: expect {content!r} got {got!r}"
+
+
 def test_parse_multipart_binary_contains_boundary_substring():
     # 对抗用例:文件内容里恰好含有 boundary 串的子序列——按"分隔行"切分不受影响
     boundary = b"ABC123"

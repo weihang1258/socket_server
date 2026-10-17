@@ -58,9 +58,8 @@ def parse_multipart(content_type: str, body: bytes) -> tuple:
             continue
         headers = seg[:header_end].decode("utf-8", "replace")
         value = seg[header_end + 4:]
-        # 去掉段尾的 \r\n(分隔行前的回车换行)
-        if value.endswith(b"\r\n"):
-            value = value[:-2]
+        # v1.7.1: 不剥尾部 CRLF——split(delim) 已消费定界串(含其前导 CRLF)，
+        # 段值尾不存在定界 CRLF；内容自己的尾 CRLF 是内容(B05 实测:无条件剥会丢字节)
         if 'name="path"' in headers:
             path_val = value.decode("utf-8", "replace")
         elif 'name="file"' in headers:
@@ -101,6 +100,10 @@ class FileHandler(BaseHTTPRequestHandler):
     """GET /files?path= 下载;POST /files multipart 上传。"""
 
     server_version = "socket_server-file/1.7"
+    # 连接 socket 超时（BaseHTTPRequestHandler -> StreamRequestHandler.setup 里 settimeout）。
+    # idle 语义：每次 recv/send 60s 静默才断——防慢客户端永久挂线程；大文件持续写不触发。
+    # 注意必须设这里：ThreadingHTTPServer 实例的 timeout 只作用于 accept select 循环。
+    timeout = 60
 
     # 静默默认 access log(默认写 stderr 会污染 systemd 日志),复用 logging
     def log_message(self, fmt, *args):
