@@ -2,6 +2,20 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.7.1] - 2026-10-17
+
+兼容 MCP 版本：mcp_socket_server 0.2.1+
+
+### 修复
+- 抓包停止链路：高流量下 stop 卡 10s 失败（drain 无时限）→ 2s 上限；停止超时仍收尾文件（不再永久截断）；stop 返回四态 JSON（stopped/exitcode/pcap_complete/note/error），重复 stop 回放上一轮真实结果。**注意：1.7.1 的 capture_stop 响应需配 mcp_socket_server 0.2.1+，旧桥会误判失败**
+- 抓包时间戳回退路径由开机秒数（落盘显示 1970 年）改为墙钟
+- socket 监听新增 datatype 175（停止监听）；171 对"换端口"明确报错（不再静默忽略）
+- 172/173 无监听时的错误从裸 b"error" 改为 JSON 文案
+- HTTP 文件服务：Handler 连接空闲超时 60s；multipart 解析丢弃内容尾部 CRLF 的字节保真修复
+
+### 兼容
+- capture_stop 响应形态变更（见上）；datatype 175 为新增分支，旧客户端零影响
+
 ## [1.7.0] - 2026-10-16
 
 兼容 DPI/MCP 版本：mcp_socket_server 0.2.0
