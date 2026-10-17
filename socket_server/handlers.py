@@ -94,7 +94,9 @@ def do(datatype, data: bytes, **kwargs):
         logger.info("停止tcpdump抓包，类型：%s，参数：%s" % (datatype, data))
         response = tcpdump_stop(**data)
         logger.info(response)
-        res = json.dumps({"res": response}).encode("utf-8")
+        # v1.7.1: tcpdump_stop 返回四态 dict，直出（旧 {"res": bool} 废弃，
+        # 配套桥侧 mcp_socket_server 0.2.1 解析；中间态兼容见 spec §1.2）
+        res = json.dumps(response, ensure_ascii=False).encode("utf-8")
         return res
 
     # 是否文件

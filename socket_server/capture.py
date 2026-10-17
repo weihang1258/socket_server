@@ -22,6 +22,9 @@ _cpu_binding_lock = threading.Lock()
 _captures = {}
 _captures_lock = threading.Lock()
 
+# 最近一次 stop 的结果留存（B03：重复 stop 回放上轮真实结果，而非裸 true 掩盖 exitcode）
+_last_stop_status = {}
+
 # Linux AF_PACKET 相关 socket 常量（Python socket 模块未导出，用数值）
 ETH_P_ALL = 0x0003
 SOL_PACKET = 263
@@ -238,10 +241,19 @@ class AFPacketCapture:
             if self._stopped.is_set() and not self._exc:
                 try:
                     self._sock.settimeout(1.0)
+                    drain_deadline = time.monotonic() + 2.0   # 置位后最多再 drain 2s（B01：无时限下
+                    # 高流量在途帧持续到达，队列永不空，线程不退 -> join(10s) 超时 -> 文件不收尾）
+                    drained_after = 0
                     while True:
+                        if time.monotonic() > drain_deadline:
+                            logger.warning(
+                                f"drain 超时(2s)，放弃残余在途帧：停止后已补收 {drained_after} 包 "
+                                f"{self.eth} -> {self.path}")
+                            break
                         try:
                             data, ancdata, _flags, _addr = self._sock.recvmsg(65535, 1024)
                         except socket.timeout:
+                            logger.info(f"drain 完成：停止后补收 {drained_after} 包 {self.eth} -> {self.path}")
                             break  # 队列已空
                         except OSError:
                             break  # 网卡不可用/已关闭
@@ -250,6 +262,7 @@ class AFPacketCapture:
                         ts_ns = self._decode_ts_ns(ancdata)
                         frame = self._restore_vlan(data, ancdata)
                         self._write_packet(frame, ts_ns)
+                        drained_after += 1
                 except Exception:
                     pass
         except Exception as e:
@@ -373,9 +386,21 @@ class AFPacketCapture:
             self._thread.join(timeout=timeout)
         alive = self._thread is not None and self._thread.is_alive()
         if alive:
-            # 线程未在超时内退出：不读 stats、不关文件，避免与仍在 _write_packet 的写入竞态
-            # （socket 仍开着让 recv 线程自然退出，本轮写入不应被 close 打断）
             logger.error(f"停止抓包线程超时(>{timeout}s)：{self.eth} -> {self.path}")
+            # B06：线程未退出也必须收尾文件，否则 pcap 永久截断。
+            # 竞态最坏损失=1 条记录（close 与写线程 write 瞬时交叉）；截断文件+明确失败信号
+            # 优于永久无尾文件。
+            if self._sock is not None:
+                try:
+                    self._sock.close()
+                except OSError:
+                    pass
+            if self._f is not None:
+                try:
+                    self._f.flush()
+                    self._f.close()
+                except Exception:
+                    pass
             return False
         # 线程已退出、socket 还活着：在 close 前抓最后一次 tpacket_stats（真实值）
         if self._sock is not None:
@@ -587,29 +612,38 @@ def _stop_capture_entry(entry):
 
 
 def tcpdump_stop(path="/home/tmp/tmp.pcap"):
-    """停止抓包（独立子进程，v1.6.0）。
-
-    幂等：path 未在抓直接返回 True。stop_evt.set 通知子进程收尾（cap.stop + sort），
-    无信号无 PID。停止失败（join 超时）：实例保留在 _captures 不移除，可重试 stop。
+    """停止抓包（独立子进程）。返回 dict 四态（v1.7.1，B02/B03）：
+    正常停止 {"stopped":True,"exitcode":N,"pcap_complete":bool}
+    从未 start {"stopped":False,"note":"no active capture for path"}
+    重复 stop   上轮 _last_stop_status + note（回放真实结果）
+    停止失败   {"stopped":False,"error":...}（实例保留可重试，既有行为）
     """
     with _captures_lock:
         entry = _captures.get(path)
     if entry is None:
-        return True  # 幂等：未在抓
+        last = _last_stop_status.get(path)
+        if last:
+            return {**last, "note": "already stopped（重复 stop，回放上轮结果）"}
+        return {"stopped": False, "note": "no active capture for path"}
     ok = _stop_capture_entry(entry)
     if not ok:
-        # 保留注册表条目，调用方可重试 stop；isrun 仍返回 True
+        status = {"path": path, "stopped": False,
+                  "error": "停止未完成（停止线程超时），实例保留可重试"}
+        _last_stop_status[path] = status
         logger.error(f"停止抓包未完成（子进程可能仍在运行），保留实例可重试：{path}")
-        return False
+        return status
     with _captures_lock:
         _captures.pop(path, None)
-    # 子进程退出码反映 cap.stop()/sort 成败（_capture_process_main 内 sys.exit(1)）：
-    # 非 0 则本轮 pcap 可能不完整/未排序，返回 False 让调用方感知（恢复 v1.5.6 失败信号传播）。
+    # 子进程退出码反映 cap.stop()/sort 成败；非 0 则本轮 pcap 可能不完整/未排序
     code = entry[0].exitcode
+    status = {"path": path, "stopped": True,
+              "exitcode": code,
+              "pcap_complete": code in (0, None)}
+    _last_stop_status[path] = status
     if code not in (0, None):
+        status["warning"] = "pcap 可能不完整/未排序"
         logger.warning(f"抓包子进程退出码 {code}，本轮 pcap 可能不完整/未排序：{path}")
-        return False
-    return True
+    return status
 
 
 def tcpdump_isrun(path="/home/tmp/tmp.pcap"):

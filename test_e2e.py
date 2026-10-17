@@ -417,6 +417,15 @@ r = recv_text_response(s)
 check("175 re-stop error", "未启动监听".encode("utf-8") in r, r)
 s.close()
 
+# ===== Test: capture_stop 四态 =====
+print("\n[Test] capture_stop 四态响应")
+s = new_sock()
+send_request(s, 6, json.dumps({"path": "/tmp/e2e_never.pcap"}).encode())
+r = recv_text_response(s)
+d = json.loads(r)
+check("never-started stopped:false", d["stopped"] is False and "note" in d, r)
+s.close()
+
 # ===== 汇总 =====
 print(f"\n{'='*50}")
 print(f"测试完成: {passed} PASS, {failed} FAIL, 共 {passed+failed} 项")
