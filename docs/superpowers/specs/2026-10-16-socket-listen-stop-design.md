@@ -29,7 +29,7 @@ datatype 175  socket监听-停止监听
        失败 -> {"error": "..."} JSON
 ```
 
-handlers.py（紧跟 174 之后，`else: pass` 之前）：
+handlers.py（datatype 200 之后、`else: pass` 之前——174 与 else 之间还有 18/200，位置任意均可）：
 
 ```python
 elif datatype == 175:
@@ -37,7 +37,14 @@ elif datatype == 175:
     if ss is None:
         return json.dumps({"error": "未启动监听"}).encode("utf-8")
     ss.stop_server()
-    stopped = not ss.pid()          # 成功判定以"端口确实没了"为准
+    # 成功判定以"端口确实没了"为准；kill -9 异步生效，ss 表更新有调度延迟，
+    # 重试 3 次 x0.5s 防误判失败（评审第 1 项）
+    stopped = False
+    for _ in range(3):
+        if not ss.pid():
+            stopped = True
+            break
+        time.sleep(0.5)
     ss = None                       # 释放单例：下次 171 可换端口重建
     if stopped:
         logger.info("socket监听已停止")
@@ -46,16 +53,18 @@ elif datatype == 175:
 ```
 
 关键决定（已核实）：
-- 成功判定**不用** `stop_server()` 返回值（其返回 `True`/`None`，"无可杀"时是 `None`），以停后 `ss.pid()` 为空为准。
+- 成功判定**不用** `stop_server()` 返回值（其返回 `True`/`None`，"无可杀"时是 `None`），以停后 `ss.pid()` 为空为准（带重试）。
+- **停止机制的事实描述（评审第 3 项修正）**：`stop_server()` 置 `_stop_flag=False` 对子进程**无效**——监听进程是 `multiprocessing.Process` fork，子进程持有 fork 时刻的 flag 副本，父进程的置位传导不过去；**实际停止完全依赖 terminate/SIGKILL**。本设计不依赖优雅退出，175 的行为与该机制吻合。
+- stop 后 cachedata 线程（start_server 起的 daemon 线程，`while True` 无退出条件）仍存活：ss=None 后 q 永远空，走 sleep(1) 空转分支——不刷日志不异常，代价是每次 stop→start 泄漏一个 idle 线程（内网场景频次极低，接受）。
 - `ss = None`（do() 顶部已有 `global ss`，赋值生效）解决换端口：下次 171 走 `not ss` 分支用新端口重建。**同时修 B08**：171 分支加端口一致性检查——`ss and ss.pid()` 且 `data.get("port") != ss.port` 时不再静默 pass，返回 `{"error": "已有监听运行在端口 X，请先停止(datatype 175)"}`。
 - stop 后 172/173/174 自然落入既有 error 分支（已核实），无需改。
-- `stop_server()` 内 `os.system(kill -9)` 是既有代码，不动（kill 的是自己查到的数字串，无注入面）。
+- `stop_server()` 内 `os.system(f"kill -9 {pid}")` 是既有代码，不动（pid 串来自 ss+awk 提取，远程调用无注入面；本地 comm 含逗号的进程理论上可干扰提取——既有 nit，不顺手改）。
 
 ### 1.2 抓包停止链路（B01+B03+B06 同根同修）
 
 **根因（已核实 capture.py:236-253）**：`_recv_loop` 的 drain 段逐帧读到 socket.timeout 为止，**无总时限**——高流量下在途帧持续到达，"队列已空"永不成立，线程不退出 → `stop()` join(10s) 超时 → `return False`（不 flush 不 close）→ 子进程 `sys.exit(1)` → 文件截断未排序。B01（10.8s 失败）/B03（重试 true 掩盖 exitcode=1）/B06（590B 尾部截断）是同一死结的三个症状。
 
-**修 1：drain 加绝对 deadline（capture.py _recv_loop drain 段）**
+**修 1：drain 加绝对 deadline（capture.py _recv_loop drain 段，完整可抄代码）**
 
 ```python
 if self._stopped.is_set() and not self._exc:
@@ -65,21 +74,27 @@ if self._stopped.is_set() and not self._exc:
         drained_after = 0
         while True:
             if time.monotonic() > drain_deadline:
-                logger.warning(f"drain 超时(2s)，放弃残余在途帧 {self.eth} -> {self.path}")
+                logger.warning(
+                    f"drain 超时(2s)，放弃残余在途帧 {drained_after} 包已收 {self.eth} -> {self.path}")
                 break
             try:
                 data, ancdata, _flags, _addr = self._sock.recvmsg(65535, 1024)
             except socket.timeout:
+                logger.info(f"drain 完成：停止后补收 {drained_after} 包 {self.eth} -> {self.path}")
                 break  # 队列已空
             except OSError:
-                break
+                break  # 网卡不可用/已关闭
             if not data:
                 break
+            ts_ns = self._decode_ts_ns(ancdata)
+            frame = self._restore_vlan(data, ancdata)
+            self._write_packet(frame, ts_ns)
             drained_after += 1
-            ...  # 原有写帧逻辑
+    except Exception:
+        pass
 ```
 
-高流量下在途帧排空实测 <100ms，2s 上限只在极端下放弃残余（打 WARNING 带帧数）——线程 2s 内必退，join(10s) 不再超时，B01 的 10.8s 失败链断根。
+放弃时机只在两条记录之间（`_write_packet` header+data 完整执行完才回 recvmsg），**deadline 放弃不产生半条记录**；半条风险只在修 2 的强制 close 竞态（已声明）。正常排空与超时放弃均记录帧数（评审第 4 项：与 B06 验证对账）。
 
 **修 2：stop 超时仍收尾文件（capture.py stop()）**
 
@@ -106,37 +121,61 @@ if alive:
 
 （修 1 生效后此路径仅在极端场景触达；保留防御。竞态最坏损失：close 与写线程 write 的瞬时交叉丢 1 条记录——写线程下一轮 recvmsg 抛 OSError 退出，不会无限写坏。）
 
-**修 3：stop 结果留存可查（B03，capture.py tcpdump_stop）**
+**修 3：stop 结果留存可查（B03，capture.py tcpdump_stop + handlers.py datatype 6 配套）**
+
+`tcpdump_stop` 返回从裸 bool 改为 dict（三态+第四态"停止失败"）：
 
 ```python
 _last_stop_status: dict[str, dict] = {}   # 模块级，{path: {...}}
 
-def tcpdump_stop(path=...):
-    ...
+def tcpdump_stop(path="/home/tmp/tmp.pcap"):
+    with _captures_lock:
+        entry = _captures.get(path)
     if entry is None:
         last = _last_stop_status.get(path)
         if last:
             # B03：对已停实例的重复 stop，回放上一轮真实结果而非裸 true
-            return json.dumps(last, ensure_ascii=False).encode("utf-8")
-        return json.dumps({"stopped": False, "note": "no active capture for path"},
-                          ensure_ascii=False).encode("utf-8")
-    ...
+            return {**last, "note": "already stopped（重复 stop，回放上轮结果）"}
+        return {"stopped": False, "note": "no active capture for path"}
+    ok = _stop_capture_entry(entry)
+    if not ok:
+        # 停止失败（join 超时）：实例保留可重试（既有行为），返回第四态
+        status = {"path": path, "stopped": False,
+                  "error": "停止未完成（停止线程超时），实例保留可重试"}
+        _last_stop_status[path] = status
+        return status
+    with _captures_lock:
+        _captures.pop(path, None)
     code = entry[0].exitcode
     status = {"path": path, "stopped": True,
               "exitcode": code,
               "pcap_complete": code in (0, None)}
     _last_stop_status[path] = status
-    ...（原有 warning 日志保留）
     if code not in (0, None):
-        return json.dumps({**status, "warning": "pcap 可能不完整/未排序"}, ensure_ascii=False).encode("utf-8")
-    return json.dumps(status, ensure_ascii=False).encode("utf-8")
+        status["warning"] = "pcap 可能不完整/未排序"
+        logger.warning(f"抓包子进程退出码 {code}，本轮 pcap 可能不完整/未排序：{path}")
+    return status
 ```
 
-**返回值形态变更（三态语义，修 B02）——三种情况统一 JSON，无裸 True**：
-- 正常停止：`{"stopped": true, "exitcode": N, "pcap_complete": bool}`
-- 从未 start 的路径：`{"stopped": false, "note": "no active capture for path"}`（**不是裸 True**——评审修正：原稿 line121"仍返回 True"与 line136 JSON 形态矛盾，统一为 JSON；裸 True 在旧桥 `get("res", False)` 下会变 False 误判失败，JSON 形态下旧桥同样误判（`"res"` 缺失→False），**兼容影响显式声明**：新服务端响应只保证配 0.2.1+ 桥，旧桥对 1.7.1 靶机的 capture_stop 会误判失败——发版顺序 1.7.1→0.2.1 期间存在此中间态，README/CHANGELOG 标注"1.7.1 靶机需配 0.2.1 桥用 capture_stop"）
-- 重复 stop（已停实例）：回放 `_last_stop_status` 上轮结果（B03）
-- 服务端返回从裸 bool 变为 dict 后，datatype 5/6 响应仍是无前缀 JSON 文本（与 `{"res": bool}` 同型），帧格式零改动；桥侧解析同步改（§2.1）。
+**handlers.py datatype 6 配套修改（评审第 3 项：原设计漏写，直接照旧包裹会把 bytes 丢进 json.dumps 炸 TypeError）**：
+
+```python
+    # 旧： res = json.dumps({"res": response}).encode("utf-8")
+    # 新： response 已是 dict（tcpdump_stop 改造后），直出
+    res = json.dumps(response, ensure_ascii=False).encode("utf-8")
+    return res
+```
+
+**四态语义汇总（修 B02+B03）**：
+
+| 场景 | 响应 | 调用方判定 |
+|---|---|---|
+| 正常停止（exitcode 0/None） | `{"stopped": true, "exitcode": 0, "pcap_complete": true}` | 成功 |
+| 停止但有损（exitcode≠0） | `{"stopped": true, "exitcode": N, "pcap_complete": false, "warning": ...}` | **failed**（pcap 可能不完整） |
+| 从未 start 的路径 | `{"stopped": false, "note": "no active capture for path"}` | 非失败（幂等明示，B02） |
+| 停止失败（join 超时） | `{"stopped": false, "error": "停止未完成..."}` | **failed**（可重试） |
+
+响应仍是无前缀 JSON 文本（与旧 `{"res": bool}` 同型），帧格式零改动；**兼容影响显式声明**：新服务端响应只保证配 0.2.1+ 桥，旧桥（`get("res", False)`）对 1.7.1 靶机的 capture_stop 会误判失败——发版顺序 1.7.1→0.2.1 期间存在此中间态，CHANGELOG 标注。桥侧解析见 §2.1。
 
 **修 4：时间戳兜底（B05，capture.py _decode_ts_ns 尾部）**
 
@@ -152,7 +191,7 @@ return time.time_ns()   # 原 time.monotonic_ns()：monotonic 是开机秒数，
 
 ### 1.4 HTTP 文件服务超时 + CRLF 修复（终审遗留，修法已实测定位）
 
-- `ThreadingHTTPServer` 实例设 `timeout = 60`（Handler socket 超时；大文件下载是持续写非 idle，60s 静默才断，不误杀）
+- **Handler 超时（评审第 10 项修正：超时设 Handler 类属性而非 server 实例——`BaseServer.timeout` 只作用于 accept 的 select 循环，不传导到已 accept 连接）**：`FileHandler.timeout = 60`（`BaseHTTPRequestHandler` 继承 `StreamRequestHandler`，setup 时对连接 socket `settimeout`，idle 语义：每次 recv/send 60s 静默才断；大文件下载持续写不触发）。连接数不加上限（内网信任模型不变）。
 - **CRLF 截断实测定案**（本轮 review 用现解析器实测三组：无尾 CRLF ✅／尾 1 条 ❌ 丢 1 条／尾 2 条 ❌ 丢 1 条）：根因是 `parse_multipart` 里 `if value.endswith(b"\r\n"): value = value[:-2]` 这两行——`split(delim)` 已把定界串（含其前导 CRLF）消费掉，段值尾**不存在**定界 CRLF，内容自己的尾 CRLF 就是不该剥的内容。**修法 = 直接删除这两行剥除逻辑**（原稿"仅最后字段才剥"的叙述是错的，multipart 语义下 split 后无需任何尾部剥除）。验收=三组 roundtrip 全字节一致。
 
 ### 1.5 不修清单（原始逻辑保持，用户裁定）
@@ -166,7 +205,11 @@ return time.time_ns()   # 原 time.monotonic_ns()：monotonic 是开机秒数，
 ### 2.1 capture_stop/capture_start 适配新响应（B01/B02/B03 桥侧）
 
 - `socket_client.capture_start`：解析 `{"res": bool}` 不变（服务端 start 响应未改）
-- `socket_client.capture_stop`：改为 `json.loads(recv_text_response())`，三分支解析（与新服务端三形态一一对应）：dict 含 `stopped` 键→新形态透传；其他 dict 含 `res` 键→旧形态（旧靶机 `{"res": bool}`）转 `{"stopped": bool, "legacy": true}`；纯 bool（理论上不出现，防御）→`{"stopped": bool, "legacy": true}`。`server.py capture_stop` 工具把 dict 透传进 results，`stopped: true and pcap_complete: false` 时该 target 判 failed 且 failed[].reason="pcap 可能不完整/未排序(exitcode=N)"——**reason:null 根治**；`stopped: false`（未在抓）非失败，正常进 results
+- `socket_client.capture_stop`：`json.loads(recv_text_response())` 后按四态解析：
+  - dict 含 `stopped` 键 → **新形态透传**（1.7.1 靶机）
+  - dict 含 `res` 键 → **旧形态（<1.7.1 靶机 `{"res": bool}`）**：`res: true` → `{"stopped": true, "legacy": true}`；**`res: false` → `{"stopped": false, "error": "停止未完成（旧版语义），可重试"}`（评审修正：旧版 false=真失败，绝不能映射为非失败的 stopped:false——那会回归 B03）**
+  - 其他 → `{"stopped": false, "error": "无法解析的服务端响应: ..."}`（防御）
+- `server.py capture_stop` 工具判定：`stopped: true and pcap_complete: false` → **failed**，reason="pcap 可能不完整/未排序(exitcode=N)"；`stopped: false and error 存在` → **failed**（reason=error 文案）；`stopped: false and note 存在` → 非失败（幂等明示，B02）——**reason:null 根治**
 
 ### 2.2 裸 bool 返回值判失败（B23）
 
@@ -211,42 +254,88 @@ finally:
 |---|---|
 | B09 桥侧 | socket_listen save/clean/stop 的 `resp=b'error'` 报错文案翻译为"靶机无监听实例，请先 action=start"（对 b"error" 特判） |
 | B13 | `_run_batch` 返回的 results 统一带 target：出口把 `[r.data for r in results if r.ok]` 包成 `[{"target": r.target, **(r.data if isinstance(r.data, dict) else {"result": r.data})} for r in results if r.ok]`——所有走 _run_batch 的工具一次性生效。**波及面（评审补充）**：capture_start 返回 bool 会包成 `{"target":..,"result": bool}`（形态变化）——mock 测试断言与 capture_start 描述同步更新；其余工具（cmd_exec/boce/replay/socket_listen 返回 dict）仅多一个 target 键，既有字段保留 |
-| B18 wait=false | run_one 返回 None 时 results 元素为 `{"target":.., "note": "wait=false 无返回值"}`（配合 B13 的 dict 包装自然实现）；描述同步 |
+| B18 wait=false | run_one 返回 None 时 results 元素为 `{"target":.., "note": "wait=false 无返回值"}`——**显式 None→note 分支**（评审修正：B13 的 dict 包装对 None 产出的是 `"result": null`，note 不会"自然实现"，须在包装处显式判 None）；描述同步 |
 | B18 白名单 | config.example.yaml 加注释样例（`cmd_exec_whitelist: ["iptables ", "tcpdump ", "ss "]`），描述加"白名单为空=不限制（默认）" |
-| B19 | `add_target` 注册前 TCP connect 探活（timeout 3s）：不通返回 `{"ok": false, "error": "host:port 不可达(TCP connect 失败)，未注册"}`；`force` 可选参数（默认 false）允许跳过探活注册离线靶机 |
+| B19 | `add_target` 注册前 TCP connect 探活（timeout 3s）：不通返回 `{"ok": false, "error": "host:port 不可达(TCP connect 失败)，未注册"}`；`force` 可选参数（默认 false）允许跳过探活注册离线靶机。**host 解析**：hostname/裸 IPv6 走 `socket.create_connection` 均可；**带方括号 IPv6（"[fd00::1]"）create_connection 失败——探活前剥方括号**（评审第 9 项）；已核实 registry.resolve 对 IPv6 裸地址原样透传不损坏 |
 | B17 | `pcap_flow_extract` 结果超 1000 条流时截断 + `{"target":.., "flows":[...], "total": N, "truncated": true}`；服务端静默空输出的行为描述注明"路径不存在/非目录返回空数组" |
 | B20/S10 | 接受 FastMCP 默认 capabilities（框架行为），**不做**——在描述性 YAGNI 记录 |
 | S01/S04/S05 | 全工具 schema 字段级补 description（FastMCP 签名 `Annotated[type, Field(description=...)]`）：targets 补"@tag 或 host:port"、boce mode 枚举说明（封堵/重定向有效；弹窗未实现恒失败）、protoType 枚举（1=TCP 2=UDP 4=ICMP）写入 pcap_flow_extract 描述 |
 | **描述完善（把"设计行为"写成明文，防再被误报）** | ① `replay_run`：**单臂回放（uplink==downlink 且无 VLAN 差异）时所有包计为 uplink，downlink/flow_count 恒 0 属正常，需方向统计用双接口**（B14 口径）；② `boce_run`：mode 仅"封堵/重定向"有判定实现，"弹窗"未实现恒失败，其他值按未知模式恒失败；③ `capture_stop`：幂等语义明示（未在抓的路径返回 stopped:false 非报错）；④ `pcap_flow_extract`：路径不存在/非目录返回空数组（既有行为） |
-| S02 | force_sport/force_dport 改纯 `int`（非 Optional，默认 0=不改写）；tags/env/vlan 保持 nullable（语义就是"可选"） |
+| S02 | **force_sport/force_dport 改纯 `int` 默认 0，且 wire 语义定死：0 → payload 省略该字段**（服务端保持 None 进 `no_tuple_modification` 判定）——若把 0 发上 wire，`replayer.py:139` 的 `all(x is None ...)` 变 False → 单臂回放开始建流 → downlink/flow_count 不再恒 0，与 B14"设计行为"口径直接冲突（评审第 6 项）；tags/env/vlan 保持 nullable（语义就是"可选"） |
 | S03 | `@mcp.tool()` 加 `title`（中文名）；annotations：`readOnlyHint=True` 标 isfile/isdir/pcap_flow_extract/list_targets，`destructiveHint=True` 标 cmd_exec/capture_stop/remove_target；**其余 5 个（add_target/capture_start/boce_run/replay_run/socket_listen）不标 annotations**（读写语义混合，标了反误导——评审补充归类） |
 | S06 | 四处描述与实际对齐：cmd_exec 白名单、capture AF_PACKET、remove_target（§2.7）、socket_listen（§2.5） |
 | S07 | capture_start/stop 默认 path 保留（原始行为）但描述加"多任务请显式传不同 path，默认路径全局共用" |
 | S09 | B17 的 1000 条上限 + cmd_exec stdout 超 64KB 截断加 `"stdout_truncated": true`（在 client 层 cmd_exec 收 gzip 结果后处理） |
 | S11 | B01（reason 必有文案）/B07（target 真名）/B09（统一文案）修复后自然消解 |
 
-### 2.7 remove_target 防误删活跃监听靶机（B16）
+### 2.7 remove_target 防误删活跃监听靶机（B16，载体重设计——评审裁定锁表标记法不可行）
 
-`server.py remove_target`：在现有"活跃锁拒绝"检查后追加一项——查该靶机是否有活跃监听：无独立查询接口，采用**标记法**：`socket_listen action=start` 成功后在该靶机的锁表登记一个长效标记锁（`LockClass.SYSTEM, key=("listen-liveness",)`，不随调用结束释放）；`action=stop` 成功后释放。remove_target 的 `has_active(host)` 天然覆盖（锁表里有就拒绝）。**版本探测的实现载体（评审缺口修正）**：0.2.0 已删 `socket_client.version()` 方法与 version_query 工具——恢复 **client 层 `version()` 方法**（datatype 14，3 行，仅 socket_listen start 内部使用，**不恢复 MCP 工具**）；start 成功后调 `version()` 探测，≥1.7.1 才登记标记锁（旧靶机无法 stop，登记会致永久不可删）。复杂度可控（一次 RTT + 3 行方法恢复），避免引入不可清理状态。
+**原锁表标记法被否**（locks.py:74-82 排他锁忽略 key：标记锁与 start/stop 的 SYSTEM 锁同类必然互自冲突；若嵌套成功则 stop 永远 acquire 不到 → 死锁，且阻塞该靶机全部排他操作）。**新载体：registry 表加 liveness 标志列**：
 
-### 2.8 timeout 参数（既有 §6 全文保留）
+```python
+# registry.py targets 表加列（SQLite ALTER TABLE ADD COLUMN，带迁移：已有库启动时补列）
+#   listen_liveness INTEGER DEFAULT 0   -- 0=无监听 1=有活跃监听
 
-§6.1-§6.6（9 工具加可选 timeout、默认值=现硬编码值、boce_run 业务参数改名 http_timeout、default_timeout config、HTTP 60s、TCP 不动）原样并入本批次。
+# server.py socket_listen 工具内（run_one 成功后，非锁逻辑）：
+#   start 成功 → _registry.set_listen_liveness(host, True)
+#   stop 成功  → _registry.set_listen_liveness(host, False)
+# remove_target（server.py）：现有 has_active 检查后追加——
+#   if _registry.get_listen_liveness(host):
+#       return {"ok": False, "error": "靶机 X 有活跃监听，请先 socket_listen action=stop"}
+
+# 版本探测（决定是否登记）：恢复 client 层 version() 方法（datatype 14，3 行，仅内部用，
+#   不恢复 MCP 工具）。注意 handlers 14 返回 json.dumps(VERSION)（带引号 JSON 字符串），
+#   client 需 json.loads；版本比较用 tuple 化（ major,minor,patch ），禁字符串直比
+#   （"1.10.0" < "1.9.0" 字典序陷阱）。≥1.7.1 才登记 liveness（旧靶机无 175 无法清理，
+#   登记会造成永久不可删）。
+```
+
+优点：registry 持久化（中央节点重启不丢）、与锁表完全解耦、remove_target 检查成本一次 SQL。代价：socket_listen 工具内多一次 DB 写 + start 时一次 version RTT。
+
+### 2.8 timeout 参数（全文并入，不再引用外部章节——评审发现原引用的 §6.1-§6.6 不存在于任何文档）
+
+**范围**：9 个业务工具加统一可选 `timeout`（秒）；注册表 3 工具（list/add/remove_target）不加。
+
+| 工具 | timeout 默认值（=现 `_run_batch` 硬编码值） |
+|---|---|
+| isfile / isdir | 15 |
+| pcap_flow_extract | 30 |
+| cmd_exec | 60（wait=false 时 15） |
+| capture_start / capture_stop | 30 |
+| boce_run | 60 |
+| replay_run | 120 |
+| socket_listen | 30 |
+
+**schema 形态**（可选不入 required）：
+```json
+"timeout": {"type": "integer", "default": <上表值>, "description": "单靶机操作超时秒数(connect+执行+返回),多靶机并行各自计时"}
+```
+
+**传递链（管道已存在，只接形参）**：工具形参 `timeout` → `_run_batch(..., timeout=timeout)` → `pool.acquire(socket_timeout=int(timeout))` → `SocketServerClient(timeout=...)`（约束 connect/send/recv）。默认行为零变化。
+
+**boce_run 双 timeout**：工具级 `timeout=60`（新增）；业务参数 `timeout: int = 3`（拨测 HTTP 请求级）改名 `http_timeout`（默认 3 不变）。**wire payload 键名保持 `"timeout"` 不变**（socket_client.boce_run 现发 `payload["timeout"]=http_timeout` 值——字段名不动，TCP 协议零改动）。破坏性：旧调用显式传过 `boce_run timeout=10` 语义变化——审计查证 0.2.0 期间 12 次调用无显式 timeout，实际影响 ~0，CHANGELOG 标注。
+
+**底层默认可配**：`config.yaml` 新增 `default_timeout: 30`；`socket_client.py DEFAULT_TIMEOUT` 改为模块加载时 env `MCP_DEFAULT_TIMEOUT` 优先、其次 config，读不到回落 30（不动态读——池化连接建连时固化）。
+
+**socket_server HTTP 超时**：见 §1.4（`FileHandler.timeout = 60`）。
+
+**cmd_exec wait=false**：fn 立即返回 None，timeout 形参无意义但无害（保留，统一签名）。
 
 ## 3. 测试计划
 
 ### socket_server（1.7.1）
 - 复现测试先行（报告的验证清单直接做用例）：
-  - B01：高流量（回放灌包）start→立即 stop：stop ≤3s 返回；pcap capinfos 无 "cut short"
+  - B01：高流量（回放灌包）start→立即 stop：stop 返回时间**断言 ≤5s**（评审修正：原 ≤3s 未计 sort 耗时——`_sort_pcap_by_timestamp` 全量载入内存排序，大 pcap 秒级；具体阈值以实测校准后在本用例固化），pcap capinfos 无 "cut short"
   - B02：stop 从未 start 的路径 → `{"stopped": false, "note": ...}`
   - B03：制造停止失败后重试 → 返回上轮 exitcode 信息（_last_stop_status 回放）
   - B05：抓 10 包 → capinfos First packet time 为当前墙钟 ±5s
-  - B06：B01 场景后逐记录解析 missing_tail=0
+  - B06：B01 场景后逐记录解析 missing_tail=0（对照 drain 日志"补收 N 包/放弃 N 包"对账）
   - 175：start→stop→ok→再 stop→error；stop 后 172/174 报未启动；换端口 start→新 pid
-  - CRLF：上传尾部带 \r\n 的文件 → roundtrip 字节一致
-  - HTTP timeout：慢客户端（nc 挂连接不发请求）60s 断开
-  - test_e2e.py：175 段 + 新 stop 响应形态段
-- 真实靶机（10.12.131.82）：start(39002)→回放打流→stop（≤3s）→capinfos 墙钟+完整性→ss 无监听→换端口 start(39003)→stop
+  - CRLF：上传尾部带 \r\n 的文件 → roundtrip 字节一致（三组：无尾/尾1条/尾2条）
+  - HTTP timeout：慢客户端（nc 挂连接不发请求）60s 断开（断言 FileHandler.timeout 生效）
+  - test_e2e.py：175 段 + 新 stop 响应四态段
+- 真实靶机（10.12.131.82）：start(39002)→回放打流→stop（计时）→capinfos 墙钟+完整性→ss 无监听→换端口 start(39003)→stop
+- 既有风险备注（非本批引入）：`_sort_pcap_by_timestamp` 全量驻内存，GB 级 pcap 有 OOM 风险——记录不在本批修
 
 ### mcp_socket_server（0.2.1）
 - mock 扩展：capture stop 新 JSON 三形态（stopped/never-started/previous-status）、175 handler、171 端口不一致 error
