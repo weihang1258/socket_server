@@ -104,7 +104,7 @@ if alive:
     return False
 ```
 
-（修 1 生效后此路径仅在极端场景触达；保留防御。）
+（修 1 生效后此路径仅在极端场景触达；保留防御。竞态最坏损失：close 与写线程 write 的瞬时交叉丢 1 条记录——写线程下一轮 recvmsg 抛 OSError 退出，不会无限写坏。）
 
 **修 3：stop 结果留存可查（B03，capture.py tcpdump_stop）**
 
@@ -118,7 +118,8 @@ def tcpdump_stop(path=...):
         if last:
             # B03：对已停实例的重复 stop，回放上一轮真实结果而非裸 true
             return json.dumps(last, ensure_ascii=False).encode("utf-8")
-        return True   # 从未 start 过的路径：幂等（原始行为）
+        return json.dumps({"stopped": False, "note": "no active capture for path"},
+                          ensure_ascii=False).encode("utf-8")
     ...
     code = entry[0].exitcode
     status = {"path": path, "stopped": True,
@@ -131,10 +132,11 @@ def tcpdump_stop(path=...):
     return json.dumps(status, ensure_ascii=False).encode("utf-8")
 ```
 
-**返回值形态变更（三态语义，修 B02）**：
-- `b"ok"` → 不再使用；改为 JSON 文本响应（`recv_text_response` 可收，协议层 5/6 本就是 JSON 文本，帧格式零改动）
-- 从未 start 的路径：仍返回 `True`（幂等，原始行为——但 JSON 形态下为 `{"stopped": false, "note": "no active capture for path"}`，语义自明，B02 解决）
-- 服务端返回从裸 bool 变为 dict 后，datatype 5/6 的响应仍是无前缀 JSON（与 `{"res": bool}` 同型），**协议兼容**；桥侧解析同步改（§2.1）。
+**返回值形态变更（三态语义，修 B02）——三种情况统一 JSON，无裸 True**：
+- 正常停止：`{"stopped": true, "exitcode": N, "pcap_complete": bool}`
+- 从未 start 的路径：`{"stopped": false, "note": "no active capture for path"}`（**不是裸 True**——评审修正：原稿 line121"仍返回 True"与 line136 JSON 形态矛盾，统一为 JSON；裸 True 在旧桥 `get("res", False)` 下会变 False 误判失败，JSON 形态下旧桥同样误判（`"res"` 缺失→False），**兼容影响显式声明**：新服务端响应只保证配 0.2.1+ 桥，旧桥对 1.7.1 靶机的 capture_stop 会误判失败——发版顺序 1.7.1→0.2.1 期间存在此中间态，README/CHANGELOG 标注"1.7.1 靶机需配 0.2.1 桥用 capture_stop"）
+- 重复 stop（已停实例）：回放 `_last_stop_status` 上轮结果（B03）
+- 服务端返回从裸 bool 变为 dict 后，datatype 5/6 响应仍是无前缀 JSON 文本（与 `{"res": bool}` 同型），帧格式零改动；桥侧解析同步改（§2.1）。
 
 **修 4：时间戳兜底（B05，capture.py _decode_ts_ns 尾部）**
 
@@ -148,10 +150,10 @@ return time.time_ns()   # 原 time.monotonic_ns()：monotonic 是开机秒数，
 
 172/173 的 `return b"error"` 改为 `return json.dumps({"error": "未启动监听"}).encode("utf-8")`（与 174 同型）。协议仍是文本响应，无兼容问题（桥侧 recv_ok 收到非 ok 字节即报错，文案见 §2.4）。
 
-### 1.4 HTTP 文件服务超时 + CRLF 修复（终审遗留）
+### 1.4 HTTP 文件服务超时 + CRLF 修复（终审遗留，修法已实测定位）
 
 - `ThreadingHTTPServer` 实例设 `timeout = 60`（Handler socket 超时；大文件下载是持续写非 idle，60s 静默才断，不误杀）
-- `parse_multipart` 尾部 CRLF 截断修复：值段 `value.endswith(b"\r\n")` 剥离改为"按段定界剥离"——分隔行前的 CRLF 属定界符，但仅当该段是最后一个字段（后面紧跟 `--boundary--`）时才有尾 CRLF 可剥；实现为：切段后若 `value.endswith(b"\r\n")` 且段尾即结束分隔则剥，正文场景由 split 消费定界符不再二次剥。**以"内容含尾部 CRLF 的 roundtrip 测试"为验收**。
+- **CRLF 截断实测定案**（本轮 review 用现解析器实测三组：无尾 CRLF ✅／尾 1 条 ❌ 丢 1 条／尾 2 条 ❌ 丢 1 条）：根因是 `parse_multipart` 里 `if value.endswith(b"\r\n"): value = value[:-2]` 这两行——`split(delim)` 已把定界串（含其前导 CRLF）消费掉，段值尾**不存在**定界 CRLF，内容自己的尾 CRLF 就是不该剥的内容。**修法 = 直接删除这两行剥除逻辑**（原稿"仅最后字段才剥"的叙述是错的，multipart 语义下 split 后无需任何尾部剥除）。验收=三组 roundtrip 全字节一致。
 
 ### 1.5 不修清单（原始逻辑保持，用户裁定）
 
@@ -164,8 +166,7 @@ return time.time_ns()   # 原 time.monotonic_ns()：monotonic 是开机秒数，
 ### 2.1 capture_stop/capture_start 适配新响应（B01/B02/B03 桥侧）
 
 - `socket_client.capture_start`：解析 `{"res": bool}` 不变（服务端 start 响应未改）
-- `socket_client.capture_stop`：改为 `json.loads(recv_text_response())` 返回 dict（`{"stopped":..,"exitcode":..,"pcap_complete":..}` 或裸 `True`（从未 start））；`server.py capture_stop` 工具把 dict 透传进 results，`pcap_complete: false` 时该 target 判 failed 且 failed[].reason="pcap 可能不完整/未排序(exitcode=N)"——**reason:null 根治**
-- 兼容旧靶机（<1.7.1 返回 `{"res": bool}`）：解析时先探 `isinstance(dict) and "res" in d` 走旧形态，否则新形态
+- `socket_client.capture_stop`：改为 `json.loads(recv_text_response())`，三分支解析（与新服务端三形态一一对应）：dict 含 `stopped` 键→新形态透传；其他 dict 含 `res` 键→旧形态（旧靶机 `{"res": bool}`）转 `{"stopped": bool, "legacy": true}`；纯 bool（理论上不出现，防御）→`{"stopped": bool, "legacy": true}`。`server.py capture_stop` 工具把 dict 透传进 results，`stopped: true and pcap_complete: false` 时该 target 判 failed 且 failed[].reason="pcap 可能不完整/未排序(exitcode=N)"——**reason:null 根治**；`stopped: false`（未在抓）非失败，正常进 results
 
 ### 2.2 裸 bool 返回值判失败（B23）
 
@@ -191,7 +192,7 @@ finally:
             lock_mgr.release(host_port, lock_class, key)
 ```
 
-语义：CAPTURE 锁仍由 stop 释放（跨调用长锁不变）；但**本次调用失败**（ok=False，含 start 返回 False/异常）时立即释放，不再留僵尸锁。stop 本身失败（ok=False）也释放——与 stop finally 无条件释放的既有行为一致。实现上 run_one 内已知 ok，用 nonlocal/返回结构传递。
+语义：CAPTURE 锁仍由 stop 释放（跨调用长锁不变）；但**本次调用失败**时立即释放，不再留僵尸锁。stop 本身失败（ok=False）也释放——与 stop finally 无条件释放的既有行为一致。实现：run_one 内局部变量 `ok = True`，`data is False` 分支与 except 分支置 `False`，finally 直接可见（同函数作用域）。
 
 ### 2.4 锁冲突文案补 target（B07）
 
@@ -208,7 +209,7 @@ finally:
 | 项 | 修复 |
 |---|---|
 | B09 桥侧 | socket_listen save/clean/stop 的 `resp=b'error'` 报错文案翻译为"靶机无监听实例，请先 action=start"（对 b"error" 特判） |
-| B13 | `_run_batch` 返回的 results 统一带 target：`_run_batch` 出口把 `[r.data for r in results if r.ok]` 包成 `[{"target": r.target, **(r.data if isinstance(r.data, dict) else {"result": r.data})}`——所有走 _run_batch 的工具（cmd_exec/capture/boce/replay/socket_listen）一次性生效；boce stats dict 与 target 合并 |
+| B13 | `_run_batch` 返回的 results 统一带 target：出口把 `[r.data for r in results if r.ok]` 包成 `[{"target": r.target, **(r.data if isinstance(r.data, dict) else {"result": r.data})} for r in results if r.ok]`——所有走 _run_batch 的工具一次性生效。**波及面（评审补充）**：capture_start 返回 bool 会包成 `{"target":..,"result": bool}`（形态变化）——mock 测试断言与 capture_start 描述同步更新；其余工具（cmd_exec/boce/replay/socket_listen 返回 dict）仅多一个 target 键，既有字段保留 |
 | B18 wait=false | run_one 返回 None 时 results 元素为 `{"target":.., "note": "wait=false 无返回值"}`（配合 B13 的 dict 包装自然实现）；描述同步 |
 | B18 白名单 | config.example.yaml 加注释样例（`cmd_exec_whitelist: ["iptables ", "tcpdump ", "ss "]`），描述加"白名单为空=不限制（默认）" |
 | B19 | `add_target` 注册前 TCP connect 探活（timeout 3s）：不通返回 `{"ok": false, "error": "host:port 不可达(TCP connect 失败)，未注册"}`；`force` 可选参数（默认 false）允许跳过探活注册离线靶机 |
@@ -217,7 +218,7 @@ finally:
 | S01/S04/S05 | 全工具 schema 字段级补 description（FastMCP 签名 `Annotated[type, Field(description=...)]`）：targets 补"@tag 或 host:port"、boce mode 枚举说明（封堵/重定向有效；弹窗未实现恒失败）、protoType 枚举（1=TCP 2=UDP 4=ICMP）写入 pcap_flow_extract 描述 |
 | **描述完善（把"设计行为"写成明文，防再被误报）** | ① `replay_run`：**单臂回放（uplink==downlink 且无 VLAN 差异）时所有包计为 uplink，downlink/flow_count 恒 0 属正常，需方向统计用双接口**（B14 口径）；② `boce_run`：mode 仅"封堵/重定向"有判定实现，"弹窗"未实现恒失败，其他值按未知模式恒失败；③ `capture_stop`：幂等语义明示（未在抓的路径返回 stopped:false 非报错）；④ `pcap_flow_extract`：路径不存在/非目录返回空数组（既有行为） |
 | S02 | force_sport/force_dport 改纯 `int`（非 Optional，默认 0=不改写）；tags/env/vlan 保持 nullable（语义就是"可选"） |
-| S03 | `@mcp.tool()` 加 `title`（中文名）；annotations 用 `readOnlyHint=True`（isfile/isdir/pcap_flow_extract/list_targets）/`destructiveHint=True`（cmd_exec/capture_stop/remove_target），FastMCP 支持 |
+| S03 | `@mcp.tool()` 加 `title`（中文名）；annotations：`readOnlyHint=True` 标 isfile/isdir/pcap_flow_extract/list_targets，`destructiveHint=True` 标 cmd_exec/capture_stop/remove_target；**其余 5 个（add_target/capture_start/boce_run/replay_run/socket_listen）不标 annotations**（读写语义混合，标了反误导——评审补充归类） |
 | S06 | 四处描述与实际对齐：cmd_exec 白名单、capture AF_PACKET、remove_target（§2.7）、socket_listen（§2.5） |
 | S07 | capture_start/stop 默认 path 保留（原始行为）但描述加"多任务请显式传不同 path，默认路径全局共用" |
 | S09 | B17 的 1000 条上限 + cmd_exec stdout 超 64KB 截断加 `"stdout_truncated": true`（在 client 层 cmd_exec 收 gzip 结果后处理） |
@@ -225,7 +226,7 @@ finally:
 
 ### 2.7 remove_target 防误删活跃监听靶机（B16）
 
-`server.py remove_target`：在现有"活跃锁拒绝"检查后追加一项——查该靶机是否有活跃监听：无独立查询接口，采用**标记法**：`socket_listen action=start` 成功后在该靶机的锁表登记一个长效标记锁（`LockClass.SYSTEM, key=("listen-liveness",)`，不随调用结束释放）；`action=stop` 成功后释放。remove_target 的 `has_active(host)` 天然覆盖（锁表里有就拒绝）。stop 语义与 1.7.1 之前的旧靶机：start 在旧靶机成功后标记同样登记，但无法 stop（旧服务端无 175）——标记永不释放会导致该靶机永久不可删，**因此标记锁的登记仅在新靶机（协议含 175）生效**：start 前 `version_query` 探测版本 ≥1.7.1 才登记。复杂度可控（一个版本判断），避免引入不可清理状态。
+`server.py remove_target`：在现有"活跃锁拒绝"检查后追加一项——查该靶机是否有活跃监听：无独立查询接口，采用**标记法**：`socket_listen action=start` 成功后在该靶机的锁表登记一个长效标记锁（`LockClass.SYSTEM, key=("listen-liveness",)`，不随调用结束释放）；`action=stop` 成功后释放。remove_target 的 `has_active(host)` 天然覆盖（锁表里有就拒绝）。**版本探测的实现载体（评审缺口修正）**：0.2.0 已删 `socket_client.version()` 方法与 version_query 工具——恢复 **client 层 `version()` 方法**（datatype 14，3 行，仅 socket_listen start 内部使用，**不恢复 MCP 工具**）；start 成功后调 `version()` 探测，≥1.7.1 才登记标记锁（旧靶机无法 stop，登记会致永久不可删）。复杂度可控（一次 RTT + 3 行方法恢复），避免引入不可清理状态。
 
 ### 2.8 timeout 参数（既有 §6 全文保留）
 
@@ -247,9 +248,10 @@ finally:
 - 真实靶机（10.12.131.82）：start(39002)→回放打流→stop（≤3s）→capinfos 墙钟+完整性→ss 无监听→换端口 start(39003)→stop
 
 ### mcp_socket_server（0.2.1）
-- mock 扩展：capture stop 新 JSON 形态（三种：stopped/never-started/previous-status）、175 handler、171 端口不一致 error
-- 单测：B23（False→failed）、B04（start 失败锁释放）、B07（冲突文案含真名）、B13（results 带 target）、B18（wait=false note）、B19（探活失败拒注册/force 绕过）、S03（annotations 在 schema）、S02（force_sport 非 nullable）
+- mock 扩展：capture stop 新 JSON 三形态（stopped/never-started/previous-status）、175 handler、171 端口不一致 error
+- 单测：B23（False→failed）、B04（start 失败锁释放）、B07（冲突文案含真名）、B13（results 带 target；capture_start bool 包装形态）、B18（wait=false note）、B19（探活失败拒注册/force 绕过）、S03（annotations 在 schema）、S02（force_sport 非 nullable）、B16（listener 活跃 remove 拒绝/stop 后可删）
 - 工具层：capture_stop 新响应三态、socket_listen stop、pcap_flow 截断
+- **描述断言防回退（评审补充）**：ListTools 校验加——capture_start 描述含"AF_PACKET"、socket_listen 描述不含"配合回放"、boce_run 描述含"弹窗未实现"、replay_run 描述含"单臂"
 - 全量 pytest + ListTools（12 工具、9 个 timeout、字段 description、annotations）
 - 真实靶机：stop 链路 + B01 高流量复现场景走 MCP 全链
 
