@@ -1,4 +1,5 @@
 import os
+import time
 import json
 import struct
 import shutil
@@ -299,6 +300,10 @@ def do(datatype, data: bytes, **kwargs):
         data = json.loads(s=data)
         logger.info("socket监听-启动监听，类型：%s，参数：%s" % (datatype, data))
         if ss and ss.pid():
+            req_port = data.get("port", 30001)
+            if req_port != ss.port:
+                return json.dumps({"error": "已有监听运行在端口 %s，请先停止(datatype 175)" % ss.port},
+                                  ensure_ascii=False).encode("utf-8")
             pass
         elif ss and not ss.pid():
             ss.start_server()
@@ -338,7 +343,7 @@ def do(datatype, data: bytes, **kwargs):
     elif datatype == 174:
         logger.info("socket监听-传输数据流，类型：%s" % datatype)
         if ss is None:
-            return json.dumps({"error": "未启动监听"}).encode("utf-8")
+            return json.dumps({"error": "未启动监听"}, ensure_ascii=False).encode("utf-8")
         content = compress_gzip(ss.data)
         msg = struct.pack("<Q", len(content)) + content
         return msg
@@ -361,6 +366,25 @@ def do(datatype, data: bytes, **kwargs):
         res = json.dumps(response).encode("utf-8")
         res = struct.pack("i", len(res)) + res
         return res
+
+    # socket监听-停止监听（v1.7.1，spec: docs/superpowers/specs/2026-10-16-socket-listen-stop-design.md §1.1）
+    elif datatype == 175:
+        logger.info("socket监听-停止监听，类型：%s" % datatype)
+        if ss is None:
+            return json.dumps({"error": "未启动监听"}, ensure_ascii=False).encode("utf-8")
+        ss.stop_server()
+        # 成功判定以"端口确实没了"为准；kill -9 异步生效，ss 表更新有调度延迟，重试 3 次 x0.5s
+        stopped = False
+        for _ in range(3):
+            if not ss.pid():
+                stopped = True
+                break
+            time.sleep(0.5)
+        ss = None   # 释放单例：下次 171 可换端口重建
+        if stopped:
+            logger.info("socket监听已停止")
+            return b"ok"
+        return json.dumps({"error": "停止监听失败，端口仍被占用"}).encode("utf-8")
 
     else:
         pass

@@ -397,6 +397,26 @@ try:
 except Exception as e:
     check("socket监听", False, f"raw={resp[:50] if resp else 'empty'}, err={e}")
 
+# ===== Test: datatype 175 停止监听 =====
+print("\n[Test] datatype 175 - socket监听停止")
+s = new_sock()
+send_request(s, 171, json.dumps({"host": None, "port": 39011}).encode())
+r = recv_text_response(s)
+check("171 start", "pid" in json.loads(r), r)
+s.close()
+
+s = new_sock()
+send_request(s, 175)
+r = recv_text_response(s)
+check("175 stop", r == b"ok", r)
+s.close()
+
+s = new_sock()
+send_request(s, 175)
+r = recv_text_response(s)
+check("175 re-stop error", "未启动监听".encode("utf-8") in r, r)
+s.close()
+
 # ===== 汇总 =====
 print(f"\n{'='*50}")
 print(f"测试完成: {passed} PASS, {failed} FAIL, 共 {passed+failed} 项")
