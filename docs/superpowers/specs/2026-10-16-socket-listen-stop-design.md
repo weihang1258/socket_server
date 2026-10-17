@@ -15,7 +15,8 @@
 
 **用户裁定（原始逻辑保持）**：
 - **B11/B12/B21 全部不修**。git 全史核对（1.2.1 基线 `91f6dd9` vs HEAD）：封堵（requests 200 判定）/重定向（跳转判定）/弹窗（"未实现判定失败"如实声明）/未知模式判定失败/默认 mode=封堵，五个逻辑点**逐字符一致**。"放通"参数值从最初落地起就不存在（走入"未知模式判定失败"是**原始设计行为**，非缺陷）；B12 chromium 检查顺序、B21 浏览器环境问题同属既有行为。工具描述补一句真话（弹窗未实现/放通非有效值），代码零改动。
-- B14（replay downlink 统计）需 DPI 环境验证成因，本批次只把 stats 原样透传的口径在描述中注明"downlink 计数依赖双接口回放，单臂回放恒 0"，修复单独排期。
+- **B14 不修（核实为设计行为，此前定性有误）**：`replayer.py:137` 单臂模式（uplink==downlink 且 VLAN 相同）+ 不改五元组时，`:743` 所有包从 uplink 发出、不建流——downlink/flow_count 恒 0 是**单臂回放的定义行为**。测试报告的单臂回放场景得出"恒 0"是误读。归入"描述完善"而非修复。
+- B17 的"静默空输出"同理核为 pcap_flow.py:42 的既有行为（非目录不入扫描列表），归入描述完善 + 可选的输入校验增强（见 §2.6）。
 
 ## 1. socket_server 侧（1.7.1）
 
@@ -214,6 +215,7 @@ finally:
 | B17 | `pcap_flow_extract` 结果超 1000 条流时截断 + `{"target":.., "flows":[...], "total": N, "truncated": true}`；服务端静默空输出的行为描述注明"路径不存在/非目录返回空数组" |
 | B20/S10 | 接受 FastMCP 默认 capabilities（框架行为），**不做**——在描述性 YAGNI 记录 |
 | S01/S04/S05 | 全工具 schema 字段级补 description（FastMCP 签名 `Annotated[type, Field(description=...)]`）：targets 补"@tag 或 host:port"、boce mode 枚举说明（封堵/重定向有效；弹窗未实现恒失败）、protoType 枚举（1=TCP 2=UDP 4=ICMP）写入 pcap_flow_extract 描述 |
+| **描述完善（把"设计行为"写成明文，防再被误报）** | ① `replay_run`：**单臂回放（uplink==downlink 且无 VLAN 差异）时所有包计为 uplink，downlink/flow_count 恒 0 属正常，需方向统计用双接口**（B14 口径）；② `boce_run`：mode 仅"封堵/重定向"有判定实现，"弹窗"未实现恒失败，其他值按未知模式恒失败；③ `capture_stop`：幂等语义明示（未在抓的路径返回 stopped:false 非报错）；④ `pcap_flow_extract`：路径不存在/非目录返回空数组（既有行为） |
 | S02 | force_sport/force_dport 改纯 `int`（非 Optional，默认 0=不改写）；tags/env/vlan 保持 nullable（语义就是"可选"） |
 | S03 | `@mcp.tool()` 加 `title`（中文名）；annotations 用 `readOnlyHint=True`（isfile/isdir/pcap_flow_extract/list_targets）/`destructiveHint=True`（cmd_exec/capture_stop/remove_target），FastMCP 支持 |
 | S06 | 四处描述与实际对齐：cmd_exec 白名单、capture AF_PACKET、remove_target（§2.7）、socket_listen（§2.5） |
@@ -260,7 +262,8 @@ finally:
 ## 5. 明确不做（YAGNI + 用户裁定）
 
 - B11/B12/B21：封堵/重定向/弹窗/chromium 检查顺序/浏览器环境——**保持原始逻辑**（git 全史核对一致）
-- B14 修复：描述注明口径，DPI 环境验证后单独排期
+- **B14：replay downlink/flow_count 单臂恒 0——设计如此**（replayer.py:137/743 directionless 定义行为），归入描述完善
+- B17 静默空输出主体：非目录不入扫描是既有行为，仅描述完善（可选增强见 §2.6 的截断上限）
 - B20/S10 capabilities：FastMCP 框架默认行为，不做
 - 多端口并发监听、stop 前自动 fetch、pause/resume、TCP 服务端超时
 - S08 additionalProperties：FastMCP 框架层能力，本批不做（schema 收紧依赖框架支持）
