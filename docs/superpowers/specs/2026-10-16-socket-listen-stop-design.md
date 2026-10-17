@@ -188,7 +188,8 @@ if data is False:
 finally:
     pool.release(client, healthy)
     if lock_mgr is not None and lock_class != LockClass.NONE:
-        if lock_class != LockClass.CAPTURE or not <本次 ok>:
+        # ok 为 run_one 局部变量(默认 True;data is False 分支与 except 分支置 False)
+        if lock_class != LockClass.CAPTURE or not ok:
             lock_mgr.release(host_port, lock_class, key)
 ```
 
