@@ -2,6 +2,13 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.7.3] - 2026-10-19
+
+兼容 MCP 版本：mcp_socket_server 0.2.5+
+
+### 修复
+- N7 chrome 僵尸累积：新增子进程收割线程（waitpid -1 WNOHANG 轮询），浏览器类拨测失败后的 chrome <defunct> 自动回收，不再耗尽 pid 表。对所有子进程僵尸通用。
+
 ## [1.7.2] - 2026-10-19
 
 兼容 MCP 版本：mcp_socket_server 0.2.3+
