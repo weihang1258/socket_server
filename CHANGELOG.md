@@ -2,7 +2,7 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
-## [1.7.2] - 2026-10-18
+## [1.7.2] - 2026-10-19
 
 兼容 MCP 版本：mcp_socket_server 0.2.3+
 
