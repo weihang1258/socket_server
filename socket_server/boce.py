@@ -377,8 +377,12 @@ class PyppeteerChecker:
             logger.error(f"{log_prefix}run_single异常: {e}")
             self.run_single_exceptions.append(str(e))
             self.run_single_request_counts.append(request_count)
-            if "Connection is closed" in str(e) and not retry:
-                logger.warning(f"{log_prefix}检测到browser已关闭，尝试重启browser并重试一次")
+            # 1.7.2: browser 进程存活但已损坏("Browser closed unexpectedly")与显式关闭
+            # ("Connection is closed")同视为需要重建重试;重建重试一次仍失败则判失败
+            retryable = ("Connection is closed" in str(e)
+                         or "Browser closed unexpectedly" in str(e))
+            if retryable and not retry:
+                logger.warning(f"{log_prefix}检测到browser已关闭/损坏，尝试重启browser并重试一次")
                 global _browser
                 if _browser is not None:
                     try:
@@ -387,6 +391,15 @@ class PyppeteerChecker:
                         pass
                     _browser = None
                 return await self.run_single(mode, retry=True, idx=idx)
+            if retryable and retry:
+                # 重建重试仍失败: browser 持续损坏,强制关闭供下次重建(1.7.2)
+                logger.warning(f"{log_prefix}重建重试仍失败，强制关闭 browser 下次重建")
+                if _browser is not None:
+                    try:
+                        await _browser.close()
+                    except Exception:
+                        pass
+                _browser = None
             self.fail += 1
         finally:
             if page:

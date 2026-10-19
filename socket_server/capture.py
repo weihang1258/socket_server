@@ -24,6 +24,7 @@ _captures_lock = threading.Lock()
 
 # 最近一次 stop 的结果留存（B03：重复 stop 回放上轮真实结果，而非裸 true 掩盖 exitcode）
 _last_stop_status = {}
+_last_start_error = {}   # N3: {path: 最近一次 start 失败原因}
 
 # Linux AF_PACKET 相关 socket 常量（Python socket 模块未导出，用数值）
 ETH_P_ALL = 0x0003
@@ -526,6 +527,7 @@ def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue
         eth = rt.get("Iface")
         if not eth:
             logger.error("未指定网卡且系统无默认路由，无法确定抓包网卡")
+            _last_start_error[path] = "未指定网卡且系统无默认路由"
             return False
 
     # 清旧文件
@@ -556,6 +558,7 @@ def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue
         proc.start()
     except Exception as e:
         logger.exception(f"启动抓包子进程失败 {eth} -> {path}: {e}")
+        _last_start_error[path] = f"启动抓包子进程失败: {e}"
         for c in (parent_conn, child_conn):
             try:
                 c.close()
@@ -587,6 +590,7 @@ def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue
 
     if status != "ready":
         logger.error(f"抓包启动失败 {eth} -> {path}: {err}")
+        _last_start_error[path] = str(err)
         # 回收子进程
         stop_evt.set()
         proc.join(timeout=5)
@@ -597,6 +601,7 @@ def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue
 
     with _captures_lock:
         _captures[path] = (proc, stop_evt)
+    _last_start_error.pop(path, None)
     logger.info(f"已开启抓包(子进程 PID={proc.pid}) {eth} -> {path}（extended={extended!r}, single_queue={single_queue}）")
     return True
 

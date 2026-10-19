@@ -85,6 +85,13 @@ def do(datatype, data: bytes, **kwargs):
         logger.info("开启tcpdump抓包，类型：%s，参数：%s" % (datatype, data))
         response = tcpdump_start(**data)
         logger.info(response)
+        # 1.7.2 N3: 失败时回传原因(桥侧 0.2.3 判 res:False 后透传给调用方)
+        if response is False:
+            from .capture import _last_start_error
+            err = _last_start_error.get(data.get("path", ""), "抓包启动失败")
+            res = json.dumps({"res": False, "error": err},
+                             ensure_ascii=False).encode("utf-8")
+            return res
         res = json.dumps({"res": response}).encode("utf-8")
         return res
 
@@ -244,10 +251,27 @@ def do(datatype, data: bytes, **kwargs):
                     return res
                 logger.info("chromium 依赖库安装成功，继续执行拨测")
 
-        response = boce.boce(**data) if boce else None
-        if response is None:
-            boce = BoceChecker()
-            response = boce.boce(**data)
+        # 1.7.2: boce() 抛异常(浏览器崩溃/关闭等)不再冒泡到协议层断连,
+        # 转为 {"error": ...} JSON(带 4B 长度前缀,与正常响应同型),调用方可读
+        try:
+            response = boce.boce(**data) if boce else None
+            if response is None:
+                boce = BoceChecker()
+                response = boce.boce(**data)
+        except Exception as e:
+            logger.error(f"拨测异常: {e}")
+            # 浏览器持续异常时清理残留 chrome 进程(1.7.2 僵尸回收),
+            # 仅在浏览器类模式触发;封堵模式(requests)不走此处
+            if str(data.get("mode", "")) != "封堵":
+                try:
+                    from .boce import kill_all_chrome
+                    kill_all_chrome()
+                    logger.info("已清理残留 chrome 进程")
+                except Exception as e2:
+                    logger.warning(f"chrome 清理失败: {e2}")
+            res = json.dumps({"error": f"拨测失败: {e}"}, ensure_ascii=False).encode("utf-8")
+            res = struct.pack("i", len(res)) + res
+            return res
         logger.info(response)
         res = json.dumps(response).encode("utf-8")
         res = struct.pack("i", len(res)) + res
