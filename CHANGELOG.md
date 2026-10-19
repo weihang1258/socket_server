@@ -2,6 +2,19 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.7.2] - 2026-10-18
+
+兼容 MCP 版本：mcp_socket_server 0.2.3+
+
+### 修复
+- 拨测(datatype 131)异常不再断连：浏览器崩溃/依赖异常转为 {"error": ...} JSON 响应，调用方可读
+- 浏览器损坏（Browser closed unexpectedly）纳入重建重试；重建仍失败强制关闭 browser 供下次重建
+- 浏览器类拨测异常时自动清理残留 chrome 进程（缓解僵尸累积）
+- 抓包(datatype 5)失败时响应携带失败原因（{"res":false,"error":"..."}，如路径不可写/无默认路由/子进程启动超时）
+
+### 兼容
+- dt5 失败响应多出 error 字段：旧桥 get("res", False) 判定不受影响
+
 ## [1.7.1] - 2026-10-17
 
 兼容 MCP 版本：mcp_socket_server 0.2.1+

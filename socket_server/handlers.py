@@ -88,7 +88,7 @@ def do(datatype, data: bytes, **kwargs):
         # 1.7.2 N3: 失败时回传原因(桥侧 0.2.3 判 res:False 后透传给调用方)
         if response is False:
             from .capture import _last_start_error
-            err = _last_start_error.get(data.get("path", ""), "抓包启动失败")
+            err = _last_start_error.get(data.get("path") or "/home/tmp/tmp.pcap", "抓包启动失败")
             res = json.dumps({"res": False, "error": err},
                              ensure_ascii=False).encode("utf-8")
             return res
@@ -262,7 +262,7 @@ def do(datatype, data: bytes, **kwargs):
             logger.error(f"拨测异常: {e}")
             # 浏览器持续异常时清理残留 chrome 进程(1.7.2 僵尸回收),
             # 仅在浏览器类模式触发;封堵模式(requests)不走此处
-            if str(data.get("mode", "")) != "封堵":
+            if data.get("mode", "封堵") != "封堵":
                 try:
                     from .boce import kill_all_chrome
                     kill_all_chrome()
