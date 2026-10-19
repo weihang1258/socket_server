@@ -297,6 +297,33 @@ def _close_browser_on_exit():
         pass
 atexit.register(_close_browser_on_exit)
 
+
+def _zombie_reaper():
+    """1.7.3 N7: 收割 agent 名下所有已退出的子进程(chrome 僵尸/抓包残留等)。
+    僵尸(<defunct>)已死,kill 无效,只能由父进程 waitpid 回收——此处统一轮询。
+    WNOHANG: 无可收时立即返回不阻塞。daemon 线程,agent 退出随之消亡。"""
+    while True:
+        try:
+            os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            pass   # 没有任何子进程
+        except OSError:
+            pass   # EINTR 等瞬时错误,下轮继续
+        time.sleep(5)
+
+
+_zombie_reaper_started = False
+
+
+def _start_zombie_reaper():
+    """幂等启动收割线程(多次调用只起一个)。"""
+    global _zombie_reaper_started
+    if _zombie_reaper_started:
+        return
+    _zombie_reaper_started = True
+    threading.Thread(target=_zombie_reaper, daemon=True, name="zombie-reaper").start()
+    logger.info("chrome 僵尸收割线程已启动")
+
 class PyppeteerChecker:
     def __init__(self, url, chromium_path, timeout=3):
         self.url = url
@@ -454,6 +481,7 @@ class BoceChecker:
         self.chromium_path = chromium_path
         self.r_checker = RequestChecker(url=self.url, timeout=self.timeout)
         self.p_checker = None  # 延迟初始化，避免 import 时 chromium 不存在导致崩溃
+        _start_zombie_reaper()
 
     def update(self):
         self.r_checker.url = self.url
