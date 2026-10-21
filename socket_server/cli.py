@@ -29,15 +29,8 @@ def cmd_serve(args):
         def on_data(self, datatype, data, **kwargs):
             return do(datatype, data, **kwargs)
 
-    # 启动自动升级后台线程
-    try:
-        from .autoupgrade import start_autoupgrade_thread
-        start_autoupgrade_thread()
-        logger = logging.getLogger("socket_server")
-        logger.info("自动升级后台线程已启动")
-    except Exception as e:
-        logger = logging.getLogger("socket_server")
-        logger.warning(f"自动升级线程启动失败（不影响服务）: {e}")
+    # （1.8.0 起）自动升级轮询线程已删除：版本查询/下载收敛到中央节点，
+    # 升级下发走 datatype 20，靶机零外呼。
 
     # 启动 HTTP 文件服务(:9001,spec: docs/superpowers/specs/2026-10-16-http-file-transfer-mcp-convergence-design.md)
     # 必须先于 start_tcp_server:TCP 主线程 serve_forever 阻塞永不返回
@@ -54,24 +47,8 @@ def cmd_serve(args):
     start_tcp_server(args.port, ServiceHandler)
 
 
-def cmd_upgrade(args):
-    """立即检查 GitHub 并升级到最新版"""
-    from . import setup_logging
-    setup_logging()
-    from .upgrader import upgrade_now
-    upgrade_now()
-
-
-def cmd_list(args):
-    """列出 GitHub 所有 Release 的版本号 + notes"""
-    from . import setup_logging
-    setup_logging()
-    from .upgrader import list_versions
-    list_versions()
-
-
 def cmd_switch(args):
-    """切换到指定版本"""
+    """切换到本地已下载的指定版本（不联网）"""
     from . import setup_logging
     setup_logging()
     from .upgrader import switch_version
@@ -138,17 +115,9 @@ def main():
     p_serve.add_argument("-p", "--port", type=int, default=9000, help="监听端口 (默认: 9000)")
     p_serve.set_defaults(func=cmd_serve)
 
-    # upgrade
-    p_upgrade = sub.add_parser("upgrade", help="立即检查并升级到最新版")
-    p_upgrade.set_defaults(func=cmd_upgrade)
-
-    # list
-    p_list = sub.add_parser("list", help="列出 GitHub 所有 Release 版本")
-    p_list.set_defaults(func=cmd_list)
-
-    # switch
-    p_switch = sub.add_parser("switch", help="切换到指定版本")
-    p_switch.add_argument("version", nargs="?", default=None, help="目标版本号（不填则交互选择）")
+    # switch（1.8.0 起仅切本地已下载版本；查询/下载在中央节点）
+    p_switch = sub.add_parser("switch", help="切换到本地已下载的指定版本")
+    p_switch.add_argument("version", nargs="?", default=None, help="目标版本号（不填则交互选择本地版本）")
     p_switch.set_defaults(func=cmd_switch)
 
     # current

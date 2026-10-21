@@ -2,6 +2,33 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.8.0] - 2026-10-21
+
+兼容 MCP 版本：mcp_socket_server 0.3.0+（upgrade_run）；1.8.0 之前接口与 1.7.x 完全一致
+
+### 变更：升级机制重构（靶机去联网化）
+- **删除靶机侧全部 GitHub 联网**：每小时版本轮询线程（autoupgrade）、raw/API 版本查询、
+  16M 二进制下载全部移除。查询与下载由中央节点（mcp_socket_server）统一执行一次，
+  靶机升级零外呼——不再有联网超时阻塞 TCP 处理，不再有连不上刷屏（3 warning + 1 error/小时）。
+- **新增 datatype 20 升级落地**：请求 `{"version":"1.8.0","sha256":"<64hex>","force":false}`。
+  前置：中央经 :9001 把二进制推到 `versions/<版本>/.staging/socket_server`。
+  行为：同步校验 sha256 + 落盘（本地毫秒级），回 `{"ok":true,"version":"..."}` 或
+  `{"error":"原因"}`（版本非法/sha 不符/autoupgrade=off/升级进行中/有其它客户端且非 force）；
+  受理后后台重启生效。重启前打一行 `升级完成：v旧 → v新`，与新进程启动行形成闭环。
+- `autoupgrade=` 配置键保留（缺省 on），语义改为"是否接受升级下发"（off 时 dt20 拒绝）；
+  `socket_server autoupgrade on|off` 命令不变。
+- CLI：`upgrade` / `list` 子命令删除；`switch` 改为仅切本地 versions/ 已有版本（缺失版本
+  不再联网下载）；`current` 改纯本地输出（不再拉 GitHub release notes，消除最后一块联网阻塞）。
+- 新增 `packaging/install.sh` 一键安装/覆盖安装：在线 `curl -fsSL .../releases/latest/download/install.sh | sudo bash`，
+  或离线包目录内 `sudo ./install.sh`；重复执行即升级/降级/覆盖修复；`/opt/socket/config` 已存在绝不覆盖；
+  curl 全程带超时（connect 10s / max 300s）+ sha256 校验。
+- 已知限制：新版本起不来时无自动回滚（与 1.7.x 一致），兜底 = 中央再推旧版 / 本机
+  `socket_server switch <旧版本>` / 重跑 install.sh。
+
+### 兼容性
+- dt5/6/131/171-175/200 等既有接口零改动；TCP 帧格式零改动；文件传输 21-24 零改动。
+- 存量 config（autoupgrade=on）升级后行为不变（接受下发）。
+
 ## [1.7.4] - 2026-10-20
 
 兼容 MCP 版本：mcp_socket_server 0.2.x（capture_stop/capture_start 兼容旧响应）

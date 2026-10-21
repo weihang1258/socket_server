@@ -67,13 +67,17 @@ sha256sum dist/socket_server | tee dist/socket_server.sha256
 **6. 生成 release notes 文件 + 创建 Release**
 ```bash
 python3 -c "from socket_server.release_notes import RELEASE_NOTES; print(RELEASE_NOTES.strip())" > /tmp/release_notes_<version>.md
+# install.sh 烧入版本号（releases/latest/download/install.sh 零参数在线安装靠它）
+sed "s/__RELEASE_VERSION__/$(python3 -c 'from socket_server.version import VERSION; print(VERSION)')/" \
+  packaging/install.sh > dist/install.sh
+chmod +x dist/install.sh
 HTTPS_PROXY=http://10.12.186.204:7897 gh release create v<version> \
   -R weihang1258/socket_server --title "v<version>" \
   --notes-file /tmp/release_notes_<version>.md \
-  dist/socket_server dist/socket_server.sha256
+  dist/socket_server dist/socket_server.sha256 dist/install.sh
 ```
 - `gh` 走代理（直连 GitHub API 偶发 EOF）。
-- 验证：`HTTPS_PROXY=http://10.12.186.204:7897 gh release view v<version> -R weihang1258/socket_server --json tagName,url,assets`，确认 assets 含 `socket_server` + `socket_server.sha256`。
+- 验证：`HTTPS_PROXY=http://10.12.186.204:7897 gh release view v<version> -R weihang1258/socket_server --json tagName,url,assets`，确认 assets 含 `socket_server` + `socket_server.sha256` + `install.sh`。
 
 **分类器拒绝 `gh release create` 时（已多次发生）**
 

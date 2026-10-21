@@ -50,6 +50,7 @@
 | **16** | Python操作 | `["1+2"]` | `[4B gzip长度][gzip(JSON)]` | 解压后: `3` |
 | **18** | 查询命令是否存在 | `{"cmd":"ls"}` | JSON | `{"res":true}` |
 | **19** | 查询版本详情 | 无 | JSON | `{"version":"1.3.0","repo":"weihang1258/socket_server","latest_version":"1.4.0","has_upgrade":true}` |
+| **20** | 升级落地(1.8.0+，中央先经 :9001 推包到 versions/<版本>/.staging/) | `{"version":"1.8.0","sha256":"<64hex>","force":false}` | JSON | `{"ok":true,"version":"1.8.0"}` 或 `{"error":"原因"}`；受理后后台重启生效 |
 | **121** | 开始scapy抓包 | `{"iface":"eth0","count":100}` | 纯文本 | `ok` |
 | **122** | 停止scapy抓包 | 无 | JSON | `ok` 或 `{"error":"未在抓包"}` |
 | **123** | 下载pcap包(需先121) | 无 | `[8B长度 Q][pcap二进制]` | pcap文件数据 |

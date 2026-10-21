@@ -425,6 +425,26 @@ r = recv_text_response(s)
 check("never-started res:true(幂等)", json.loads(r).get("res") is True, r)
 s.close()
 
+# ===== Test: datatype 20 升级落地(1.8.0+,错误路径,不触发重启) =====
+print("\n[Test] datatype 20 - 升级落地(错误路径)")
+s = new_sock()
+send_request(s, 20, json.dumps({"version": "../evil", "sha256": "0" * 64}).encode())
+r = recv_text_response(s)
+check("dt20 非法版本拒绝", b"error" in r, r)
+s.close()
+
+s = new_sock()
+send_request(s, 20, json.dumps({"version": "9.9.9", "sha256": "short"}).encode())
+r = recv_text_response(s)
+check("dt20 非法 sha 拒绝", b"error" in r, r)
+s.close()
+
+s = new_sock()
+send_request(s, 20, json.dumps({"version": "9.9.9", "sha256": "a" * 64}).encode())
+r = recv_text_response(s)
+check("dt20 无推送包拒绝", b"error" in r and "未找到".encode("utf-8") in r, r)
+s.close()
+
 # ===== 汇总 =====
 print(f"\n{'='*50}")
 print(f"测试完成: {passed} PASS, {failed} FAIL, 共 {passed+failed} 项")

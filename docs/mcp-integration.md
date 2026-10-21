@@ -41,7 +41,7 @@ socket_server 作为执行单元，通过独立的 MCP server 暴露给 LLM 平�
 | 位置 | `/opt/socket_server` | `/opt/mcp_socket_server`（同级） |
 | 运行时 | CentOS 7 + Python 3.8 + PyInstaller 单文件 | 中央节点 + Python 3.10+ |
 | 依赖 | scapy/requests/pyppeteer 等 | mcp SDK + asyncio + 本仓库客户端库 |
-| 发版 | GitHub Release + 自动升级 | 独立 git 仓库，独立发版 |
+| 发版 | GitHub Release + 中央推送升级（install.sh / dt20，1.8.0 起靶机不联网） | 独立 git 仓库，独立发版 |
 | 安全边界 | TCP 9000（内网信任） | 对外暴露，需鉴权/审计/注入防护 |
 
 **不要把 MCP 代码塞进 socket_server 仓库。** 部署位置、依赖栈、发版节奏、安全模型都不同，物理隔离。
@@ -73,6 +73,7 @@ socket_server 作为执行单元，通过独立的 MCP server 暴露给 LLM 平�
 | 9 | 创建目录 | 写 | file_io | 短排他 |
 | 11 | 文件大小 | 读 | None | 自由并发 |
 | 14 | 获取版本号 | 读 | None | 自由并发 |
+| 20 | 升级落地（1.8.0+：中央 :9001 推包后下发；校验落盘+后台重启） | 写 | system | 同靶机排他 |
 | 18 | 命令是否存在 | 读 | None | 自由并发 |
 | 131 | 拨测（需 chromium） | 写 | browser | 同靶机排他 |
 | 171-174 | 抓包/发包相关 | 写 | capture/replay | 见上 |

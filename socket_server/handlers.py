@@ -1,9 +1,11 @@
 import os
+import re
 import time
 import json
 import struct
 import shutil
 import logging
+import threading
 from io import BytesIO
 
 from .version import VERSION, REPO
@@ -25,6 +27,74 @@ logger = logging.getLogger(__name__)
 ss = None
 boce = None  # 延迟初始化，避免 import 时依赖 chromium
 cache_sendpkts = None
+
+# dt20 升级落地并发防护：同一时刻只允许一个落盘流程
+_upgrade_lock = threading.Lock()
+_UPGRADE_VERSION_RE = re.compile(r"^\d+(\.\d+){1,3}$")
+
+
+def _apply_pushed_upgrade(data):
+    """dt20 同步段：校验 + 落盘（纯本地，毫秒级）。返回 (响应字节, 需后台重启的版本或 None)。
+
+    设计要点（评审定案）：
+    - sha 校验/落盘同步做：失败当场回 {"error": 原因}，调用方无需轮询猜测；
+    - 只有 service_restart 放后台：回包 sendall 返回即字节已入内核缓冲，
+      后台 sleep 0.3s 再重启，响应必达；
+    - 空闲判断用 active_clients > 1：该计数含 dt20 自身这条连接。
+    """
+    version = str(data.get("version") or "").strip().lstrip("v")
+    expected_sha = str(data.get("sha256") or "").strip().lower()
+    force = bool(data.get("force", False))
+    if not _UPGRADE_VERSION_RE.match(version):
+        return json.dumps({"error": "version 参数非法（期望如 1.8.0）"},
+                          ensure_ascii=False).encode(), None
+    if len(expected_sha) != 64 or any(c not in "0123456789abcdef" for c in expected_sha):
+        return json.dumps({"error": "缺少或非法 sha256（需 64 位十六进制）"},
+                          ensure_ascii=False).encode(), None
+    from .autoupgrade import _read_autoupgrade_config
+    if not _read_autoupgrade_config():
+        return json.dumps({"error": "本机 autoupgrade=off，已拒绝升级"
+                                    "（/opt/socket/config 改为 on 后重试）"},
+                          ensure_ascii=False).encode(), None
+    if not _upgrade_lock.acquire(blocking=False):
+        return json.dumps({"error": "升级进行中，请勿重复下发"},
+                          ensure_ascii=False).encode(), None
+    try:
+        try:
+            from .server import get_idle_state
+            active_clients, _ = get_idle_state()
+            if active_clients > 1 and not force:
+                return json.dumps(
+                    {"error": "还有 %d 个其它客户端连接，拒绝升级（force=true 可强制）"
+                              % (active_clients - 1)},
+                    ensure_ascii=False).encode(), None
+        except ImportError:
+            pass
+        from .upgrader import finalize_pushed_version
+        ok, err = finalize_pushed_version(version, expected_sha)
+        if not ok:
+            logger.error(f"升级落盘失败: {err}")
+            return json.dumps({"error": err}, ensure_ascii=False).encode(), None
+        return json.dumps({"ok": True, "version": version}).encode(), version
+    finally:
+        _upgrade_lock.release()
+
+
+def _restart_after_upgrade(version):
+    """dt20 后台段：切 current 软链 + 重启，使新版本生效。
+
+    必须走 switch_to（原子软链 + 打"升级完成" + 重启），不能只 service_restart——
+    unit 的 ExecStart 指向 current 软链，不切链重启回来还是旧版本（wire 实测教训）。
+    switch_to 里的"升级完成"日志打在 restart 之前：restart 会杀死本进程。
+    正常情况下 switch_to 不返回（进程被 systemd 替换）。
+    """
+    try:
+        time.sleep(0.3)  # 让 dt20 响应先送达客户端的余量（字节已在内核缓冲）
+        from .upgrader import switch_to
+        if not switch_to(version):
+            logger.error(f"升级切换失败：版本 {version} 落盘后仍不可切换（见上方日志）")
+    except Exception as e:
+        logger.error(f"升级切换失败: {e}")
 
 
 def do(datatype, data: bytes, **kwargs):
@@ -276,6 +346,17 @@ def do(datatype, data: bytes, **kwargs):
             info = {"version": VERSION, "repo": REPO, "release_notes": "", "latest_version": VERSION, "has_upgrade": False}
         res = json.dumps(info).encode("utf-8")
         return res
+
+    # 升级推送落地（1.8.0+）：中央经 :9001 推包到 versions/<版本>/.staging/ 后下发。
+    # 同步段只做本地校验+落盘（毫秒级），立即回终态；重启在后台线程执行，不占 TCP 连接。
+    elif datatype == 20:
+        data = json.loads(s=data)
+        logger.info("升级推送落地，类型：%s，参数：%s" % (datatype, data))
+        resp, restart_version = _apply_pushed_upgrade(data)
+        if restart_version:
+            threading.Thread(target=_restart_after_upgrade, args=(restart_version,),
+                             daemon=True, name="upgrade-restart").start()
+        return resp
 
     # 解压zip文件
     elif datatype == 15:
