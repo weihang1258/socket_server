@@ -85,13 +85,6 @@ def do(datatype, data: bytes, **kwargs):
         logger.info("开启tcpdump抓包，类型：%s，参数：%s" % (datatype, data))
         response = tcpdump_start(**data)
         logger.info(response)
-        # 1.7.2 N3: 失败时回传原因(桥侧 0.2.3 判 res:False 后透传给调用方)
-        if response is False:
-            from .capture import _last_start_error
-            err = _last_start_error.get(data.get("path") or "/home/tmp/tmp.pcap", "抓包启动失败")
-            res = json.dumps({"res": False, "error": err},
-                             ensure_ascii=False).encode("utf-8")
-            return res
         res = json.dumps({"res": response}).encode("utf-8")
         return res
 
@@ -101,9 +94,7 @@ def do(datatype, data: bytes, **kwargs):
         logger.info("停止tcpdump抓包，类型：%s，参数：%s" % (datatype, data))
         response = tcpdump_stop(**data)
         logger.info(response)
-        # v1.7.1: tcpdump_stop 返回四态 dict，直出（旧 {"res": bool} 废弃，
-        # 配套桥侧 mcp_socket_server 0.2.1 解析；中间态兼容见 spec §1.2）
-        res = json.dumps(response, ensure_ascii=False).encode("utf-8")
+        res = json.dumps({"res": response}).encode("utf-8")
         return res
 
     # 是否文件
@@ -251,27 +242,10 @@ def do(datatype, data: bytes, **kwargs):
                     return res
                 logger.info("chromium 依赖库安装成功，继续执行拨测")
 
-        # 1.7.2: boce() 抛异常(浏览器崩溃/关闭等)不再冒泡到协议层断连,
-        # 转为 {"error": ...} JSON(带 4B 长度前缀,与正常响应同型),调用方可读
-        try:
-            response = boce.boce(**data) if boce else None
-            if response is None:
-                boce = BoceChecker()
-                response = boce.boce(**data)
-        except Exception as e:
-            logger.error(f"拨测异常: {e}")
-            # 浏览器持续异常时清理残留 chrome 进程(1.7.2 僵尸回收),
-            # 仅在浏览器类模式触发;封堵模式(requests)不走此处
-            if data.get("mode", "封堵") != "封堵":
-                try:
-                    from .boce import kill_all_chrome
-                    kill_all_chrome()
-                    logger.info("已清理残留 chrome 进程")
-                except Exception as e2:
-                    logger.warning(f"chrome 清理失败: {e2}")
-            res = json.dumps({"error": f"拨测失败: {e}"}, ensure_ascii=False).encode("utf-8")
-            res = struct.pack("i", len(res)) + res
-            return res
+        response = boce.boce(**data) if boce else None
+        if response is None:
+            boce = BoceChecker()
+            response = boce.boce(**data)
         logger.info(response)
         res = json.dumps(response).encode("utf-8")
         res = struct.pack("i", len(res)) + res
@@ -326,10 +300,6 @@ def do(datatype, data: bytes, **kwargs):
         data = json.loads(s=data)
         logger.info("socket监听-启动监听，类型：%s，参数：%s" % (datatype, data))
         if ss and ss.pid():
-            req_port = data.get("port", 30001)
-            if req_port != ss.port:
-                return json.dumps({"error": "已有监听运行在端口 %s，请先停止(datatype 175)" % ss.port},
-                                  ensure_ascii=False).encode("utf-8")
             pass
         elif ss and not ss.pid():
             ss.start_server()
@@ -350,7 +320,7 @@ def do(datatype, data: bytes, **kwargs):
             logger.info("数据清理完成")
         else:
             logger.info("请先启动监听")
-            return json.dumps({"error": "未启动监听"}, ensure_ascii=False).encode("utf-8")
+            return b"error"
         return b"ok"
 
     # socket监听-保存数据
@@ -362,14 +332,14 @@ def do(datatype, data: bytes, **kwargs):
             logger.info(f"数据保存完成：{data['file']}")
         else:
             logger.info("请先启动监听")
-            return json.dumps({"error": "未启动监听"}, ensure_ascii=False).encode("utf-8")
+            return b"error"
         return b"ok"
 
     # socket监听-传输数据
     elif datatype == 174:
         logger.info("socket监听-传输数据流，类型：%s" % datatype)
         if ss is None:
-            return json.dumps({"error": "未启动监听"}, ensure_ascii=False).encode("utf-8")
+            return json.dumps({"error": "未启动监听"}).encode("utf-8")
         content = compress_gzip(ss.data)
         msg = struct.pack("<Q", len(content)) + content
         return msg
@@ -393,20 +363,19 @@ def do(datatype, data: bytes, **kwargs):
         res = struct.pack("i", len(res)) + res
         return res
 
-    # socket监听-停止监听（v1.7.1，spec: docs/superpowers/specs/2026-10-16-socket-listen-stop-design.md §1.1）
+    # socket监听-停止监听（独立分支，其余逻辑均为 v1.7.0 原样）
     elif datatype == 175:
         logger.info("socket监听-停止监听，类型：%s" % datatype)
         if ss is None:
             return json.dumps({"error": "未启动监听"}, ensure_ascii=False).encode("utf-8")
         ss.stop_server()
-        # 成功判定以"端口确实没了"为准；kill -9 异步生效，ss 表更新有调度延迟，重试 3 次 x0.5s
         stopped = False
         for _ in range(3):
             if not ss.pid():
                 stopped = True
                 break
             time.sleep(0.5)
-        ss = None   # 释放单例：下次 171 可换端口重建
+        ss = None
         if stopped:
             logger.info("socket监听已停止")
             return b"ok"

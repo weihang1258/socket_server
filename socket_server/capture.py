@@ -22,10 +22,6 @@ _cpu_binding_lock = threading.Lock()
 _captures = {}
 _captures_lock = threading.Lock()
 
-# 最近一次 stop 的结果留存（B03：重复 stop 回放上轮真实结果，而非裸 true 掩盖 exitcode）
-_last_stop_status = {}
-_last_start_error = {}   # N3: {path: 最近一次 start 失败原因}
-
 # Linux AF_PACKET 相关 socket 常量（Python socket 模块未导出，用数值）
 ETH_P_ALL = 0x0003
 SOL_PACKET = 263
@@ -97,15 +93,11 @@ class AFPacketCapture:
         # 'hw_ts'  -> SO_TIMESTAMPING 硬件 RX（网卡 PHC，亚纳秒，mlx5/ixgbe 物理网卡支持）
         # 'sw_ts'  -> SO_TIMESTAMPING 软中断 RX（纳秒，等同 SO_TIMESTAMPNS，virtio 等）
         # 'ns_ts'  -> SO_TIMESTAMPNS（纳秒，老内核/驱动不支持 SO_TIMESTAMPING 的兜底）
-        # 'userspace' -> time.time_ns() 墙钟在 recvmsg 返回时取（微秒级，全失败的兜底）
+        # 'userspace' -> time.monotonic_ns() 在 recvmsg 返回时取（微秒级，全失败的兜底）
         self._ts_mode = 'userspace'
         # hw_ts 模式下若 cmsg ts[0] 全零（驱动/内核未填 PHC），退化软中断 ts[1]；
         # 首次退化 warn 一次，让 35 mlx5 这类声称支持 HW 的网卡能一眼看出 HW 是否真生效（不静默退化）。
         self._hw_degraded_warned = False
-        # _decode_ts_ns 墙钟回退分支的 once-only 日志节流：fallback 在收包热路径
-        # per-packet 触发，高流量下逐包 warning 会刷屏+拖慢收包；只告警一次，
-        # 行为（每次 return time.time_ns()）不受影响。
-        self._ts_fallback_warned = False
 
     def _open(self):
         # proto=0 创建：packet_create（af_packet.c:3393）仅在 proto!=0 时 __register_prot_hook
@@ -123,7 +115,7 @@ class AFPacketCapture:
         #   L1 sw_ts：L0 setsockopt 失败（ENOPROTOOPT）-> 退 SO_TIMESTAMPING 仅 RX_SOFTWARE
         #             -> cmsg ts[1]（等同 SO_TIMESTAMPNS）
         #   L2 ns_ts：L1 也失败 -> SO_TIMESTAMPNS（老内核 2.6.x，极罕见）
-        #   L3 userspace：L2 也失败 -> recvmsg 返回时 time.time_ns() 墙钟（精度最低，兜底）
+        #   L3 userspace：L2 也失败 -> recvmsg 返回时 time.monotonic_ns()（精度最低，兜底）
         ts_flags = SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RX_SOFTWARE | SOF_TIMESTAMPING_RAW_HARDWARE
         try:
             s.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPING, ts_flags)
@@ -246,19 +238,10 @@ class AFPacketCapture:
             if self._stopped.is_set() and not self._exc:
                 try:
                     self._sock.settimeout(1.0)
-                    drain_deadline = time.monotonic() + 2.0   # 置位后最多再 drain 2s（B01：无时限下
-                    # 高流量在途帧持续到达，队列永不空，线程不退 -> join(10s) 超时 -> 文件不收尾）
-                    drained_after = 0
                     while True:
-                        if time.monotonic() > drain_deadline:
-                            logger.warning(
-                                f"drain 超时(2s)，放弃残余在途帧：停止后已补收 {drained_after} 包 "
-                                f"{self.eth} -> {self.path}")
-                            break
                         try:
                             data, ancdata, _flags, _addr = self._sock.recvmsg(65535, 1024)
                         except socket.timeout:
-                            logger.info(f"drain 完成：停止后补收 {drained_after} 包 {self.eth} -> {self.path}")
                             break  # 队列已空
                         except OSError:
                             break  # 网卡不可用/已关闭
@@ -267,7 +250,6 @@ class AFPacketCapture:
                         ts_ns = self._decode_ts_ns(ancdata)
                         frame = self._restore_vlan(data, ancdata)
                         self._write_packet(frame, ts_ns)
-                        drained_after += 1
                 except Exception:
                     pass
         except Exception as e:
@@ -275,14 +257,14 @@ class AFPacketCapture:
             logger.exception(f"抓包线程异常 {self.eth} -> {self.path}")
 
     def _decode_ts_ns(self, ancdata):
-        """据 self._ts_mode 从 ancdata 解码纳秒时间戳，回退到 time.time_ns()。
+        """据 self._ts_mode 从 ancdata 解码纳秒时间戳，回退到 time.monotonic_ns()。
 
         - 'hw_ts'/'sw_ts'：取 SCM_TIMESTAMPING cmsg（struct[3] timespec，ts[0]HW ts[1]SW ts[2]unused）。
           hw_ts 模式下 ts[0] 非零用硬件（亚纳秒 PHC），ts[0]==0 退 ts[1]（软中断纳秒）--由 cmsg 内容
           自适应，不依赖预探测硬件支持（驱动/内核不给 HW 就自动降级，与 setsockopt 时探测解耦）。
           sw_ts 模式下直接用 ts[1]。
         - 'ns_ts'：取 SO_TIMESTAMPNS cmsg（单 timespec）。
-        - 'userspace'：cmsg 无时间戳，回退墙钟 time.time_ns()（_recv_loop 已包此分支）。
+        - 'userspace'：cmsg 无时间戳，调用点用 time.monotonic_ns()（_recv_loop 已包此分支）。
         timespec 用 @ll 解（time_t + long，按平台 long 宽度对齐，与 SO_TIMESTAMPNS 同）。
         """
         if self._ts_mode in ('hw_ts', 'sw_ts'):
@@ -310,14 +292,8 @@ class AFPacketCapture:
                 if cmsg_level == socket.SOL_SOCKET and cmsg_type == SO_TIMESTAMPNS:
                     tv_sec, tv_nsec = struct.unpack("@ll", cmsg_data)
                     return tv_sec * 1_000_000_000 + tv_nsec
-        # userspace 模式 / hw_ts|sw_ts 但 cmsg 缺失或 ts 全零 -> 回退墙钟（B05：
-        # monotonic 是开机秒数，按 Unix 纪元解释落盘=1970）。NTP step 窗口内保序
-        # 不保证（kernel 时间戳同受影响，既有共性边界）；排序由 _sort_pcap_by_timestamp 兜底。
-        # 高流量下此分支 per-packet 触发，日志 once-only（只节流日志不节流行为）。
-        if not self._ts_fallback_warned:
-            logger.warning(f"cmsg 时间戳缺失，回退墙钟 time_ns：{self.eth} -> {self.path}")
-            self._ts_fallback_warned = True
-        return time.time_ns()
+        # userspace 模式 / hw_ts|sw_ts 但 cmsg 缺失或 ts 全零 -> 调用点取单调纳秒
+        return time.monotonic_ns()
 
     def _restore_vlan(self, data, ancdata):
         """若内核 auxdata 标记帧带 VLAN，把被剥离的 802.1Q 标签插回 offset 12，还原在线帧。
@@ -397,21 +373,9 @@ class AFPacketCapture:
             self._thread.join(timeout=timeout)
         alive = self._thread is not None and self._thread.is_alive()
         if alive:
+            # 线程未在超时内退出：不读 stats、不关文件，避免与仍在 _write_packet 的写入竞态
+            # （socket 仍开着让 recv 线程自然退出，本轮写入不应被 close 打断）
             logger.error(f"停止抓包线程超时(>{timeout}s)：{self.eth} -> {self.path}")
-            # B06：线程未退出也必须收尾文件，否则 pcap 永久截断。
-            # 竞态最坏损失=1 条记录（close 与写线程 write 瞬时交叉）；截断文件+明确失败信号
-            # 优于永久无尾文件。
-            if self._sock is not None:
-                try:
-                    self._sock.close()
-                except OSError:
-                    pass
-            if self._f is not None:
-                try:
-                    self._f.flush()
-                    self._f.close()
-                except Exception:
-                    pass
             return False
         # 线程已退出、socket 还活着：在 close 前抓最后一次 tpacket_stats（真实值）
         if self._sock is not None:
@@ -527,7 +491,6 @@ def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue
         eth = rt.get("Iface")
         if not eth:
             logger.error("未指定网卡且系统无默认路由，无法确定抓包网卡")
-            _last_start_error[path] = "未指定网卡且系统无默认路由"
             return False
 
     # 清旧文件
@@ -558,7 +521,6 @@ def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue
         proc.start()
     except Exception as e:
         logger.exception(f"启动抓包子进程失败 {eth} -> {path}: {e}")
-        _last_start_error[path] = f"启动抓包子进程失败: {e}"
         for c in (parent_conn, child_conn):
             try:
                 c.close()
@@ -590,7 +552,6 @@ def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue
 
     if status != "ready":
         logger.error(f"抓包启动失败 {eth} -> {path}: {err}")
-        _last_start_error[path] = str(err)
         # 回收子进程
         stop_evt.set()
         proc.join(timeout=5)
@@ -601,7 +562,6 @@ def tcpdump_start(eth=None, path="/home/tmp/tmp.pcap", extended="", single_queue
 
     with _captures_lock:
         _captures[path] = (proc, stop_evt)
-    _last_start_error.pop(path, None)
     logger.info(f"已开启抓包(子进程 PID={proc.pid}) {eth} -> {path}（extended={extended!r}, single_queue={single_queue}）")
     return True
 
@@ -627,38 +587,29 @@ def _stop_capture_entry(entry):
 
 
 def tcpdump_stop(path="/home/tmp/tmp.pcap"):
-    """停止抓包（独立子进程）。返回 dict 四态（v1.7.1，B02/B03）：
-    正常停止 {"stopped":True,"exitcode":N,"pcap_complete":bool}
-    从未 start {"stopped":False,"note":"no active capture for path"}
-    重复 stop   上轮 _last_stop_status + note（回放真实结果）
-    停止失败   {"stopped":False,"error":...}（实例保留可重试，既有行为）
+    """停止抓包（独立子进程，v1.6.0）。
+
+    幂等：path 未在抓直接返回 True。stop_evt.set 通知子进程收尾（cap.stop + sort），
+    无信号无 PID。停止失败（join 超时）：实例保留在 _captures 不移除，可重试 stop。
     """
     with _captures_lock:
         entry = _captures.get(path)
     if entry is None:
-        last = _last_stop_status.get(path)
-        if last:
-            return {**last, "note": "already stopped（重复 stop，回放上轮结果）"}
-        return {"stopped": False, "note": "no active capture for path"}
+        return True  # 幂等：未在抓
     ok = _stop_capture_entry(entry)
     if not ok:
-        status = {"path": path, "stopped": False,
-                  "error": "停止未完成（停止线程超时），实例保留可重试"}
-        _last_stop_status[path] = status
+        # 保留注册表条目，调用方可重试 stop；isrun 仍返回 True
         logger.error(f"停止抓包未完成（子进程可能仍在运行），保留实例可重试：{path}")
-        return status
+        return False
     with _captures_lock:
         _captures.pop(path, None)
-    # 子进程退出码反映 cap.stop()/sort 成败；非 0 则本轮 pcap 可能不完整/未排序
+    # 子进程退出码反映 cap.stop()/sort 成败（_capture_process_main 内 sys.exit(1)）：
+    # 非 0 则本轮 pcap 可能不完整/未排序，返回 False 让调用方感知（恢复 v1.5.6 失败信号传播）。
     code = entry[0].exitcode
-    status = {"path": path, "stopped": True,
-              "exitcode": code,
-              "pcap_complete": code in (0, None)}
-    _last_stop_status[path] = status
     if code not in (0, None):
-        status["warning"] = "pcap 可能不完整/未排序"
         logger.warning(f"抓包子进程退出码 {code}，本轮 pcap 可能不完整/未排序：{path}")
-    return status
+        return False
+    return True
 
 
 def tcpdump_isrun(path="/home/tmp/tmp.pcap"):

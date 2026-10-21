@@ -2,6 +2,20 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.7.4] - 2026-10-20
+
+兼容 MCP 版本：mcp_socket_server 0.2.x（capture_stop/capture_start 兼容旧响应）
+
+### 回退
+- **接口行为整体回退到 v1.7.0**：dt5/dt6/131/171/172/173/174 的请求与响应格式恢复 v1.7.0 原样
+  （dt6 恢复 {"res": bool}；dt5 失败恢复 {"res": false}；171 换端口恢复静默忽略；172/173 失败恢复裸 b"error"）。
+  原因：现场程序按 v1.7.0 响应格式解析，新格式导致解析不兼容。
+- 保留项：datatype 175（监听停止）保留；drain/时间戳墙钟/HTTP 文件服务等**内部行为**一并回退
+  （dt5/dt6 恢复 v1.7.0 语义后，1.7.1 的停止链路修复随之移除）。
+
+### 保留
+- datatype 175 停止监听接口保留（v1.7.1 引入的唯一位号新增）。
+
 ## [1.7.3] - 2026-10-19
 
 兼容 MCP 版本：mcp_socket_server 0.2.5+
