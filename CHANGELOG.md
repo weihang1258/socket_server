@@ -2,6 +2,19 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.8.1] - 2026-10-22
+
+兼容 MCP 版本：mcp_socket_server 0.3.1（无损，老桥可照常用 1.8.1 靶机）
+
+### 修复
+- **重启等端口释放**：主服务 :9000 两个监听 socket（IPv4/IPv6）开启
+  `allow_reuse_address`（SO_REUSEADDR），TIME_WAIT 残留不再阻塞新进程 bind。
+  此前 restart 后须等 :9000 自然过期 60 秒以上（35 靶机实测超 90 秒，
+  systemd 每 5 秒拉起一次、失败一次），现重启秒起。
+  server.py 起服段另补 `daemon_threads=True`（与 :9001/http_file.py、
+  socket_listen.py 既有写法对齐）。
+- 兼容性：监听行为变更仅影响"旧进程退出→新进程 bind"窗口；协议、datatype、日志均不变。
+
 ## [1.8.0] - 2026-10-21
 
 兼容 MCP 版本：mcp_socket_server 0.3.0+（upgrade_run）；1.8.0 之前接口与 1.7.x 完全一致

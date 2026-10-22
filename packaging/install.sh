@@ -70,6 +70,12 @@ if [ -z "$SRC_DIR" ]; then
     SRC_DIR="$TMP"
 fi
 
+# 离线模式版本号：从包内二进制取（current 子命令 1.8.0 起纯本地输出，无网络等待）
+if [ -n "$SRC_DIR" ] && [ -z "$VERSION" ]; then
+    VERSION=$("$SRC_DIR/socket_server" current 2>/dev/null | head -1 | awk '{print $NF}' | tr -d 'v')
+    [ -n "$VERSION" ] || die "无法从包内二进制解析版本号，请显式传参：./install.sh 1.8.0"
+fi
+
 # ---- 1.5 升级场景：记旧版本（current 软链名即版本号，零执行零网络）、停旧服务 ----
 OLD_VERSION=""
 if [ -L "$VERSIONS_DIR/current" ]; then

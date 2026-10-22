@@ -97,13 +97,13 @@ HTTPS_PROXY=http://10.12.186.204:7897 gh release create v<version> \
 - **cli.py** — CLI argument parsing, subcommand dispatch
 - **protocol.py** — TCP protocol handler (`MyTCPHandler`): binary framing (4-byte length prefix + `datatype` + payload), file transfer, compression
 - **handlers.py** — Datatype dispatch (`do(datatype, data)`): 0=scapy packet send, 14=version, 131=boce (browser measurement), file ops, capture start/stop, etc.
-- **server.py** — TCP server launcher (IPv4+IPv6), client connection tracking for upgrade idle check
+- **server.py** — TCP server launcher (IPv4+IPv6 双栈，`allow_reuse_address` + `daemon_threads`，1.8.1 起重启秒起不等待 TIME_WAIT)，client connection tracking for upgrade idle check
 - **netutils.py** — Network utilities: `exec_cmd_subprocess` (always `shell=False` + list args — never shell injection), routeinfo, MTU, file ops, subprocess env cleanup
 - **capture.py** — tcpdump/dumpcap integration (start/stop/isrun), scapy sniff fallback
 - **replayer.py** — PCAP replay via tcpreplay (898 lines)
 - **boce.py** — HTTP/HTTPS measurement via `requests` (simple) or `pyppeteer` (browser)
-- **upgrader.py** — GitHub API integration: raw version check (CDN), ETag cache, binary download + sha256 verify, version switching
-- **autoupgrade.py** — Auto-upgrade background thread: hourly check via raw CDN → download via API → switch when idle ≥30min
+- **upgrader.py** — 本地升级落地：校验中央经 :9001 推到 staging 的二进制（sha256）并落盘；原子切换 current 软链 + 重启；switch/list/current 只读本地 versions/（1.8.0 起靶机零 GitHub 联网，查询/下载收敛到中央节点）
+- **autoupgrade.py** — 仅剩 config `autoupgrade=` 开关读写（语义：是否接受中央升级下发，缺省 on）。每小时 GitHub 轮询线程已随 1.8.0 删除
 - **supervisor.py** — systemd unit management (enable/disable/start/stop/restart), unit self-heal on serve startup
 - **socket_listen.py** — Port listening detection
 - **pcap_flow.py** — PCAP flow extraction

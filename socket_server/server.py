@@ -43,7 +43,16 @@ def start_tcp_server(port, handler_class):
     """启动 IPv4 + IPv6 双栈 TCP 服务器，阻塞运行。"""
     handler = handler_class
 
-    server4 = socketserver.ThreadingTCPServer(('0.0.0.0', port), handler)
+    # 1.8.1: allow_reuse_address=True —— 旧进程退出后 :9000 的 TIME_WAIT 残留
+    # 不再阻塞新进程 bind，重启秒起（此前要等 TIME_WAIT 自然过期 60s+，
+    # systemd 每 5s 拉起一次、失败一次，实测 35 靶机超 90s 才恢复）。
+    # daemon_threads=True —— 处理线程随主进程退出，不 pin 住旧进程
+    #（与 http_file.py :9001 / socket_listen.py 既有写法对齐）。
+    class ThreadingTCPServer4(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    server4 = ThreadingTCPServer4(('0.0.0.0', port), handler)
     server6 = None
 
     logger.info(f"监听 0.0.0.0:{port} (IPv4)")
@@ -51,6 +60,8 @@ def start_tcp_server(port, handler_class):
     try:
         class ThreadingTCPServer6(socketserver.ThreadingTCPServer):
             address_family = socket.AF_INET6
+            allow_reuse_address = True
+            daemon_threads = True
             def server_bind(self):
                 self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
                 super().server_bind()
