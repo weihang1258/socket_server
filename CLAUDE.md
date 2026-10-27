@@ -102,6 +102,7 @@ HTTPS_PROXY=http://10.12.186.204:7897 gh release create v<version> \
 - **capture.py** — tcpdump/dumpcap integration (start/stop/isrun), scapy sniff fallback
 - **replayer.py** — PCAP replay via tcpreplay (898 lines)
 - **boce.py** — HTTP/HTTPS measurement via `requests` (simple) or `pyppeteer` (browser)
+- **http_file.py** — :9001 HTTP 文件服务（GET 下载/POST multipart 上传，客户端↔靶机点对点直传，不经 MCP 中转）。1.8.2 起全程流式，内存恒定支持 GB 级；上传直写 `<path>.part` 原子顶替
 - **upgrader.py** — 本地升级落地：校验中央经 :9001 推到 staging 的二进制（sha256）并落盘；原子切换 current 软链 + 重启；switch/list/current 只读本地 versions/（1.8.0 起靶机零 GitHub 联网，查询/下载收敛到中央节点）
 - **autoupgrade.py** — 仅剩 config `autoupgrade=` 开关读写（语义：是否接受中央升级下发，缺省 on）。每小时 GitHub 轮询线程已随 1.8.0 删除
 - **supervisor.py** — systemd unit management (enable/disable/start/stop/restart), unit self-heal on serve startup

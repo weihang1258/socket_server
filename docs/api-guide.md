@@ -102,3 +102,8 @@ curl -F "path=/home/tmp/deploy.zip" -F "file=@deploy.zip" http://<host>:9001/fil
 ```
 
 注意：开启了 firewalld 的靶机需放行 9001 端口（`firewall-cmd --add-port=9001/tcp --permanent && firewall-cmd --reload`）；内网默认无 firewalld 阻拦（与 TCP 9000 同级）。
+
+**大小不限（1.8.2+）**：上传下载全程流式（边收边写/边读边发），服务内存恒定
+（实测 2GB 传输 RSS 峰值 ~20MB），GB 级文件无压力；1.8.1 及更早整载内存，
+仅建议 MB 级，且文件内容含 `\r\n--<boundary>` 前缀序列时可能被截短（已修复）。
+上传中落盘为 `<path>.part` 临时文件，收完原子顶替，中断不留半截文件。
