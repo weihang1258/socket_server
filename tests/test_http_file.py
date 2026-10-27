@@ -1,4 +1,5 @@
 """http_file 模块单元测试(纯函数级,不起真实服务器的部分)。"""
+import io
 import json
 import os
 import sys
@@ -8,7 +9,11 @@ import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from socket_server.http_file import parse_multipart, read_http_port, start_http_file_server_for_test
+from socket_server.http_file import (
+    parse_multipart_stream,
+    read_http_port,
+    start_http_file_server_for_test,
+)
 
 
 def _multipart_body(path_val: str, filename: str, content: bytes, boundary: bytes) -> bytes:
@@ -29,45 +34,131 @@ def _multipart_body(path_val: str, filename: str, content: bytes, boundary: byte
     return b"".join(parts)
 
 
-def test_parse_multipart_basic():
-    body = _multipart_body("/home/tmp/a.pcap", "a.pcap", b"\x00\x01\x02DATA", b"XBOUNDRY")
-    ct = 'multipart/form-data; boundary=XBOUNDRY'
-    path, content = parse_multipart(ct, body)
-    assert path == "/home/tmp/a.pcap"
-    assert content == b"\x00\x01\x02DATA"
+def _run_stream(body: bytes, boundary: bytes, open_file, length=None):
+    """把 body 当 rfile 流喂给解析器。"""
+    return parse_multipart_stream(io.BytesIO(body), len(body) if length is None else length,
+                                  boundary, open_file)
 
 
+class _MemSink:
+    """open_file 替身:全部收进内存,便于断言。"""
 
-def test_parse_multipart_binary_contains_boundary_substring():
-    # 对抗用例:文件内容里恰好含有 boundary 串的子序列——按"分隔行"切分不受影响
+    def __init__(self):
+        self.written = b""
+        self.path_seen = "UNSET"
+
+    def open(self, path_val):
+        self.path_seen = path_val
+        return self
+
+    def write(self, b):
+        self.written += b
+
+
+def test_parse_stream_basic():
+    sink = _MemSink()
+    payload = bytes(range(256))
+    body = _multipart_body("/home/tmp/a.pcap", "a.pcap", payload, b"XBOUNDRY")
+    r = _run_stream(body, b"XBOUNDRY", sink.open)
+    assert r["path"] == "/home/tmp/a.pcap"
+    assert r["size"] == len(payload)
+    assert sink.written == payload
+
+
+def test_parse_stream_large_crosses_chunks():
+    # 内容远超 _BodyReader.CHUNK(256K),逼出 stream_value 的"留尾/多轮"路径
+    payload = os.urandom(256 * 1024 * 4 + 12345)
+    sink = _MemSink()
+    body = _multipart_body("/tmp/big.bin", "big.bin", payload, b"XBOUND")
+    r = _run_stream(body, b"XBOUND", sink.open)
+    assert r["size"] == len(payload)
+    assert sink.written == payload
+
+
+def test_parse_stream_binary_contains_boundary_substring():
+    # 对抗用例:文件内容里恰好含 boundary 串子序列——"分隔行"切分不受影响
     boundary = b"ABC123"
-    tricky = b"xABC123x" + bytes(range(256)) + b"ABC123tail"
+    tricky = b"xABC123x" + bytes(range(256)) + b"ABC123tail" + b"\r\n--ABC123x" * 3
+    sink = _MemSink()
     body = _multipart_body("/tmp/t", "t.bin", tricky, boundary)
-    path, content = parse_multipart(f"multipart/form-data; boundary=ABC123", body)
-    assert path == "/tmp/t"
-    assert content == tricky
+    r = _run_stream(body, boundary, sink.open)
+    assert r["path"] == "/tmp/t"
+    assert sink.written == tricky
 
 
-def test_parse_multipart_missing_path_field():
+def test_parse_stream_boundary_near_chunk_edge():
+    # 分隔串跨 chunk 边界:内容长度选成使 \r\n--XBOUND 恰落在 256K 边界附近,
+    # stream_value 每轮保留 len(delim)-1 尾字节,必须不误写不漏写
+    for pad in (-7, -3, -1, 0, 1, 3, 7):
+        payload = b"A" * (256 * 1024 + pad)
+        sink = _MemSink()
+        body = _multipart_body("/tmp/s.bin", "s.bin", payload, b"SPLITB")
+        r = _run_stream(body, b"SPLITB", sink.open)
+        assert sink.written == payload and r["size"] == len(payload), f"pad={pad}"
+
+
+def test_parse_stream_file_before_path_order():
+    # 非常规顺序:file 字段在前(path 未知 -> open_file 收到 None,走临时文件路径)
+    boundary = b"ORD"
+    body = (
+        b"--ORD\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="f.bin"\r\n\r\n'
+        b"CONTENT-XYZ\r\n"
+        b"--ORD\r\n"
+        b'Content-Disposition: form-data; name="path"\r\n\r\n'
+        b"/tmp/late.bin\r\n"
+        b"--ORD--\r\n"
+    )
+    sink = _MemSink()
+    r = _run_stream(body, boundary, sink.open)
+    assert r["path"] == "/tmp/late.bin"
+    assert r["size"] == len(b"CONTENT-XYZ")
+    assert sink.written == b"CONTENT-XYZ"
+    assert sink.path_seen is None  # 证明走了 path=None 的临时文件分支
+
+
+def test_parse_stream_missing_path_field():
     boundary = b"B1"
     body = (
         b"--B1\r\n"
         b'Content-Disposition: form-data; name="file"; filename="f"\r\n\r\n'
         b"abc\r\n--B1--\r\n"
     )
+    sink = _MemSink()
+    r = _run_stream(body, boundary, sink.open)
+    assert r["path"] is None  # 解析层不报错,由 handler 层判缺 path 拒绝
+    assert sink.written == b"abc"
+
+
+def test_parse_stream_truncated_body():
+    # Content-Length 大于实际 body:读值阶段发现流枯竭,必须抛错而非静默收下
+    sink = _MemSink()
+    body = _multipart_body("/tmp/t.bin", "t.bin", b"0123456789", b"TR")
     try:
-        parse_multipart("multipart/form-data; boundary=B1", body)
+        _run_stream(body[:len(body) - 5], b"TR", sink.open, length=len(body))
         assert False, "should raise"
     except ValueError:
         pass
 
 
-def test_parse_multipart_missing_boundary():
-    try:
-        parse_multipart("multipart/form-data", b"xx")
-        assert False, "should raise"
-    except ValueError:
-        pass
+def test_parse_stream_unknown_field_skipped():
+    boundary = b"U1"
+    body = (
+        b"--U1\r\n"
+        b'Content-Disposition: form-data; name="junk"\r\n\r\n'
+        b"IGNORED\r\n"
+        b"--U1\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="f"\r\n\r\n'
+        b"KEEP\r\n"
+        b"--U1\r\n"
+        b'Content-Disposition: form-data; name="path"\r\n\r\n'
+        b"/tmp/u.bin\r\n"
+        b"--U1--\r\n"
+    )
+    sink = _MemSink()
+    r = _run_stream(body, boundary, sink.open)
+    assert r["path"] == "/tmp/u.bin"
+    assert sink.written == b"KEEP"
 
 
 def test_read_http_port_default_when_no_config():
@@ -154,6 +245,81 @@ def test_post_upload_roundtrip(tmpdir):
         assert result["size"] == len(payload)
         with open(dst, "rb") as f:
             assert f.read() == payload
+        assert not os.path.exists(dst + ".part")  # .part 收尾必须已顶替/清理
+    finally:
+        stop()
+
+
+def test_post_upload_path_first_streaming(tmpdir):
+    # path 在前(文档用法):直写 <dest>.part 后 os.replace 顶替
+    dst = str(tmpdir.join("stream") + "/big.bin")
+    payload = os.urandom(256 * 1024 * 2 + 555)  # 跨多个读入 chunk
+    body = _multipart_body(dst, "big.bin", payload, b"PB")
+    base, stop = _get_free_http_server(tmpdir)
+    try:
+        req = urllib.request.Request(
+            base + "/files", data=body,
+            headers={"Content-Type": "multipart/form-data; boundary=PB"},
+            method="POST")
+        with urllib.request.urlopen(req) as resp:
+            result = json.loads(resp.read())
+        assert result["ok"] is True
+        assert result["size"] == len(payload)
+        with open(dst, "rb") as f:
+            assert f.read() == payload
+        assert not os.path.exists(dst + ".part")
+    finally:
+        stop()
+
+
+def test_post_upload_file_before_path(tmpdir):
+    # file 在前:走系统临时文件再搬到 dest(handler 的兜底分支)
+    dst = str(tmpdir.join("late") + "/f.bin")
+    payload = b"LATE-ORDER-\x00\xff"
+    boundary = b"LB"
+    body = (
+        b"--" + boundary + b"\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="f.bin"\r\n\r\n' +
+        payload + b"\r\n"
+        b"--" + boundary + b"\r\n"
+        b'Content-Disposition: form-data; name="path"\r\n\r\n' +
+        dst.encode() + b"\r\n"
+        b"--" + boundary + b"--\r\n"
+    )
+    base, stop = _get_free_http_server(tmpdir)
+    try:
+        req = urllib.request.Request(
+            base + "/files", data=body,
+            headers={"Content-Type": "multipart/form-data; boundary=LB"},
+            method="POST")
+        with urllib.request.urlopen(req) as resp:
+            result = json.loads(resp.read())
+        assert result["ok"] is True
+        assert result["size"] == len(payload)
+        with open(dst, "rb") as f:
+            assert f.read() == payload
+    finally:
+        stop()
+
+
+def test_post_upload_truncated_leaves_no_part(tmpdir):
+    # body 截断:400 且不留 .part / 临时文件残留
+    dst = str(tmpdir.join("tr") + "/t.bin")
+    full = _multipart_body(dst, "t.bin", b"0123456789" * 100, b"TB")
+    body = full[:len(full) - 8]  # 去掉尾部,Content-Length 按完整 body 算
+    base, stop = _get_free_http_server(tmpdir)
+    try:
+        req = urllib.request.Request(
+            base + "/files", data=body,
+            headers={"Content-Type": "multipart/form-data; boundary=TB"},
+            method="POST")
+        try:
+            urllib.request.urlopen(req)
+            assert False, "should 400"
+        except urllib.error.HTTPError as e:
+            assert e.code == 400
+        assert not os.path.exists(dst)
+        assert not os.path.exists(dst + ".part")
     finally:
         stop()
 

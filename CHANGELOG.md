@@ -2,6 +2,28 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.8.2] - 2026-10-27
+
+兼容 MCP 版本：mcp_socket_server 0.3.2（file_transfer 指引工具）；旧 MCP 无损可用
+
+### 变更：:9001 文件服务全程流式（支持 GB 级大文件）
+
+- **上传流式化**：POST /files multipart 解析重写为边收边写——path 字段先到
+  （curl -F 文档用法）则直写目标 `<path>.part` 临时文件，收完 `os.replace`
+  原子顶替；file 先到则落系统临时文件再搬运。内存占用恒定（实测 ~18MB RSS），
+  与文件大小无关。
+- **下载流式化**：GET /files?path= 改 1MB 分块边读盘边发，Content-Length 锁定
+  发送上限；客户端中断按 info 记一行，不再抛 traceback。
+- **大文件实测**：2GB 上传 4.6s / 下载 3.5s，sha256 双向一致，服务进程 RSS
+  峰值 18-20MB（旧实现峰值 ≈ 2×文件大小，GB 级必然 OOM 且拖死 :9000 主服务）。
+- **修复存量缺陷（上传内容截短）**：文件内容中出现 `\r\n--<boundary>` 前缀
+  但后随非 `--`/`\r\n`（如 `\r\n--ABC123x`）时，旧整载解析器会误判为分隔行，
+  文件被截短丢字节（复现：307 字节只收 274）。新解析器按 RFC 2046 校验
+  分隔行后随字符，内容不丢字节。**建议尽快升级**——旧版本上传 pcap 中恰含
+  这种序列时文件已可能损坏。
+- 兼容性：HTTP 接口（URL、参数、multipart 字段名、JSON 响应结构）完全不变，
+  curl 命令与 MCP push_binary 零改动。
+
 ## [1.8.1] - 2026-10-22
 
 兼容 MCP 版本：mcp_socket_server 0.3.1（无损，老桥可照常用 1.8.1 靶机）
