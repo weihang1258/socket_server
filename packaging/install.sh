@@ -52,7 +52,10 @@ if [ -z "$SRC_DIR" ]; then
     [ -n "$VERSION" ] || VERSION=$(latest_tag) || VERSION=""
     [ -n "$VERSION" ] || VERSION="$BURNED_VERSION"
     case "$VERSION" in v[0-9]*) VERSION="${VERSION#v}" ;; esac
-    [ "$VERSION" != "__RELEASE_VERSION__" ] || die "在线模式版本解析失败，请显式传版本号：install.sh 1.8.0"
+    # 守卫只认"未烧版占位符"特征(下划线):不写占位符字面量,发版 sed 全局替换
+    # 就无从误伤本行——曾因烧入后变成 [ "$VERSION" != "1.8.2" ],latest 恰为
+    # 烧入版本时误判"版本解析失败"直接退出(1.8.2 实测踩中)
+    case "$VERSION" in *__*) die "在线模式版本解析失败，请显式传版本号：install.sh <版本号>" ;; esac
     TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
     log "下载 v$VERSION ..."
     # curl 必须带超时：下载地址不可达时无超时会永久挂死（实机安装测出）
