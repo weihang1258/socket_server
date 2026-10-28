@@ -2,6 +2,19 @@
 
 本文件记录 socket_server 各版本的变更。版本号见 [`socket_server/version.py`](socket_server/version.py)。
 
+## [1.8.3] - 2026-10-28
+
+兼容 MCP 版本：mcp_socket_server 0.3.2（无损）
+
+### 变更：日志路径支持环境变量覆盖（非 root 开发场景）
+
+- `setup_logging`/`setup_child_logging` 的日志路径优先级改为：
+  **显式参数 > 环境变量 `SOCKET_SERVER_LOG` > `/var/log/socket_server.log`（默认）**。
+- 背景：开发环境迁移到非 root 用户（35/weihang，rootless podman 构建）后，
+  跑 `serve`/`current` 在日志初始化处 Permission denied。开发实例用法：
+  `SOCKET_SERVER_LOG=~/socket_server_dev.log ./dist/socket_server serve -p 9500`
+- 生产零影响：systemd 部署不设该变量，日志路径与行为和 1.8.2 完全一致。
+
 ## [1.8.2] - 2026-10-27
 
 兼容 MCP 版本：mcp_socket_server 0.3.2（file_transfer 指引工具）；旧 MCP 无损可用

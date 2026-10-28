@@ -12,11 +12,20 @@ logger.setLevel(logging.INFO)
 _fh = None
 _ch = None
 
-def setup_logging(log_file="/var/log/socket_server.log"):
+def _log_path(explicit):
+    """日志路径优先级:显式参数 > 环境变量 SOCKET_SERVER_LOG > /var/log 默认。
+    环境变量供非 root 开发场景覆盖(1.8.3):开发实例
+    SOCKET_SERVER_LOG=~/socket_server_dev.log ./dist/socket_server serve -p 9500;
+    生产 systemd 部署不设该变量,路径与行为不变。"""
+    return explicit or os.environ.get("SOCKET_SERVER_LOG") or "/var/log/socket_server.log"
+
+
+def setup_logging(log_file=None):
     """初始化日志 handler（仅在 serve 时调用）"""
     global _fh, _ch
     if _ch is not None:
         return  # 已初始化
+    log_file = _log_path(log_file)
     _ch = logging.StreamHandler()
     _ch.setLevel(logging.INFO)
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
@@ -31,7 +40,7 @@ def setup_logging(log_file="/var/log/socket_server.log"):
         logger.addHandler(_fh)
 
 
-def setup_child_logging(log_file="/var/log/socket_server.log"):
+def setup_child_logging(log_file=None):
     """抓包子进程（capture.py _capture_process_main）入口日志初始化。
 
     fork 模式下子进程继承主进程的 handler（_ch 已非 None），无需重复添加，直接复用--
@@ -43,6 +52,7 @@ def setup_child_logging(log_file="/var/log/socket_server.log"):
     global _ch, _fh
     if _ch is not None:
         return  # fork：已继承，复用
+    log_file = _log_path(log_file)
     # spawn：从头建（与 setup_logging 同构，但不写 _ch 全局标记副作用以外的逻辑）
     _ch = logging.StreamHandler()
     _ch.setLevel(logging.INFO)
