@@ -17,7 +17,7 @@ docker build --network host -t socket_server-builder:centos7-py38 \
 
 # Build binary
 rm -rf dist build
-docker run --rm -v $(pwd):/work -w /work socket_server-builder:centos7-py38 \
+docker run --rm --network host -v $(pwd):/work -w /work socket_server-builder:centos7-py38 \
   sh -c 'pip3 install --proxy http://10.12.186.204:7897 \
     -i https://pypi.tuna.tsinghua.edu.cn/simple \
     scapy requests psutil wheel pyinstaller packaging pyppeteer && \
@@ -49,13 +49,14 @@ git push origin v<version>
 **4. 构建（CentOS 7 builder）**
 ```bash
 rm -rf dist build
-docker run --rm -v $(pwd):/work -w /work socket_server-builder:centos7-py38 \
+docker run --rm --network host -v $(pwd):/work -w /work socket_server-builder:centos7-py38 \
   sh -c 'pip3 install --proxy http://10.12.186.204:7897 \
     -i https://pypi.tuna.tsinghua.edu.cn/simple \
     scapy requests psutil wheel pyinstaller packaging pyppeteer && \
   pyinstaller packaging/socket_server.spec --clean --noconfirm'
 ```
 - 看 exit code + `ls -lh dist/socket_server`（应 16M，ELF x86-64）。
+- 本机 rootless podman 缺 slirp4netns（源里也没有），容器默认网络不通：`docker run` 必须带 `--network host`，否则容器内 pip 装不了依赖。
 - `./dist/socket_server current` 确认版本号。
 - 改动涉及运行时行为的，起 `serve` 跑一次对应 datatype 端到端验证。
 
@@ -76,7 +77,7 @@ HTTPS_PROXY=http://10.12.186.204:7897 gh release create v<version> \
   --notes-file /tmp/release_notes_<version>.md \
   dist/socket_server dist/socket_server.sha256 dist/install.sh
 ```
-- `gh` 走代理（直连 GitHub API 偶发 EOF）。
+- GitHub 直连可用但慢；代理对 githubusercontent CDN 的 TLS 不稳（curl exit 35/92）。release 大文件下载走镜像：`https://ghfast.top/<原GitHub URL>`。gh 装于 `~/.local/bin`。
 - 验证：`HTTPS_PROXY=http://10.12.186.204:7897 gh release view v<version> -R weihang1258/socket_server --json tagName,url,assets`，确认 assets 含 `socket_server` + `socket_server.sha256` + `install.sh`。
 
 **分类器拒绝 `gh release create` 时（已多次发生）**
